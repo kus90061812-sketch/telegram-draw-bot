@@ -11,6 +11,7 @@ from urllib.parse import quote_plus
 
 import feedparser
 import requests
+from bs4 import BeautifulSoup
 import psycopg
 from openai import OpenAI
 
@@ -409,6 +410,7 @@ def league_code_from_name(name):
     for sport, league, league_name, pick_group in MAJOR_LEAGUES:
         if league_name == name:
             return sport, league
+    # 국내/일본 리그는 ESPN recent-game helper를 쓰지 않음
     return None, None
 
 def fetch_recent_team_games(team_name, sport, league, lookback=5):
@@ -560,26 +562,32 @@ def build_free_game_context(games):
         sport, league = league_code_from_name(g["league"])
         item = dict(g)
 
-        try:
-            item["home_recent"] = fetch_recent_team_games(
-                g["home"], sport, league, RECENT_GAMES_LOOKBACK
-            )
-        except Exception:
+        if sport and league:
+            try:
+                item["home_recent"] = fetch_recent_team_games(
+                    g["home"], sport, league, RECENT_GAMES_LOOKBACK
+                )
+            except Exception:
+                item["home_recent"] = {}
+
+            try:
+                item["away_recent"] = fetch_recent_team_games(
+                    g["away"], sport, league, RECENT_GAMES_LOOKBACK
+                )
+            except Exception:
+                item["away_recent"] = {}
+
+            try:
+                item["event_context"] = fetch_summary_team_context(
+                    g["event_id"], sport, league
+                )
+            except Exception:
+                item["event_context"] = {}
+        else:
+            # KBO/NPB/K리그는 공식 일정 + 최근 뉴스 중심
             item["home_recent"] = {}
-
-        try:
-            item["away_recent"] = fetch_recent_team_games(
-                g["away"], sport, league, RECENT_GAMES_LOOKBACK
-            )
-        except Exception:
             item["away_recent"] = {}
-
-        try:
-            item["event_context"] = fetch_summary_team_context(
-                g["event_id"], sport, league
-            )
-        except Exception:
-            item["event_context"] = {}
+            item["event_context"] = {"source": g.get("source", "official")}
 
         out.append(item)
 
@@ -798,13 +806,9 @@ def run_news_cycle(conn):
 # MAJOR LEAGUE SCHEDULE
 # =========================
 MAJOR_LEAGUES = [
-    # 야구: KBO + NPB는 같은 그룹, MLB 별도
-    ("baseball", "kbo", "KBO", "asia_baseball"),
-    ("baseball", "npb", "NPB", "asia_baseball"),
+    # ESPN에서 안정적으로 조회할 해외 메이저 리그만
     ("baseball", "mlb", "MLB", "mlb"),
 
-    # 축구: 인기 리그만
-    ("soccer", "kor.1", "K League 1", "soccer"),
     ("soccer", "eng.1", "EPL", "soccer"),
     ("soccer", "esp.1", "La Liga", "soccer"),
     ("soccer", "ger.1", "Bundesliga", "soccer"),
@@ -812,15 +816,298 @@ MAJOR_LEAGUES = [
     ("soccer", "fra.1", "Ligue 1", "soccer"),
     ("soccer", "uefa.champions", "UEFA Champions League", "soccer"),
 
-    # 농구: 인기 리그만
-    ("basketball", "kbl", "KBL", "basketball"),
     ("basketball", "nba", "NBA", "basketball"),
 ]
+
+DOMESTIC_LEAGUES = {
+    "KBO": "asia_baseball",
+    "NPB": "asia_baseball",
+    "K League 1": "soccer",
+    "KBL": "basketball",
+}
+
+
+
+def _within_prematch_window(start_utc):
+    now = datetime.now(timezone.utc)
+    mins = (start_utc - now).total_seconds() / 60
+    return PREMATCH_MIN_MINUTES <= mins <= PREMATCH_MAX_MINUTES, round(mins)
+
+def _clean_team_text(x):
+    return re.sub(r"\s+", " ", (x or "")).strip()
+
+def fetch_kbo_official_games():
+    """KBO 공식 영문 Daily Schedule에서 당일 경기를 읽는다."""
+    now_kst = datetime.now(timezone(timedelta(hours=9)))
+    year = now_kst.year
+    month = now_kst.month
+    day = now_kst.day
+
+    url = "https://eng.koreabaseball.com/Schedule/DailySchedule.aspx"
+    games = []
+
+    try:
+        r = requests.get(
+            url,
+            params={"searchDate": f"{year}.{month:02d}"},
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code != 200:
+            log.warning("KBO official schedule HTTP %s", r.status_code)
+            return []
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.find_all("tr")
+        current_day = None
+
+        for tr in rows:
+            cells = [_clean_team_text(td.get_text(" ", strip=True)) for td in tr.find_all(["th","td"])]
+            if not cells:
+                continue
+
+            joined = " | ".join(cells)
+
+            # 날짜가 있는 행
+            mdate = re.search(r'(\d{2})\.(\d{2})', joined)
+            if mdate:
+                try:
+                    current_day = int(mdate.group(2))
+                except Exception:
+                    pass
+
+            if current_day != day:
+                continue
+
+            # 시간
+            mt = re.search(r'\b([01]?\d|2[0-3]):([0-5]\d)\b', joined)
+            if not mt:
+                continue
+
+            # KBO 영문 팀명 후보
+            teams = []
+            KBO_NAMES = [
+                "LG","HANWHA","SSG","SAMSUNG","NC","KT","LOTTE","KIA","DOOSAN","KIWOOM"
+            ]
+            for name in KBO_NAMES:
+                if re.search(rf'\b{name}\b', joined, re.I):
+                    teams.append(name)
+
+            # 중복 제거 + 2팀 필요
+            uniq = []
+            for t in teams:
+                if t not in uniq:
+                    uniq.append(t)
+            if len(uniq) < 2:
+                continue
+
+            hh, mm = int(mt.group(1)), int(mt.group(2))
+            start_kst = datetime(year, month, day, hh, mm, tzinfo=timezone(timedelta(hours=9)))
+            start_utc = start_kst.astimezone(timezone.utc)
+            ok, mins = _within_prematch_window(start_utc)
+            if not ok:
+                continue
+
+            away, home = uniq[0], uniq[1]
+            games.append({
+                "event_id": f"KBO-{start_kst.strftime('%Y%m%d')}-{away}-{home}",
+                "sport": "baseball",
+                "league": "KBO",
+                "pick_group": "asia_baseball",
+                "home": home,
+                "away": away,
+                "start_utc": start_utc.isoformat(),
+                "minutes_to_start": mins,
+                "source": "KBO official",
+            })
+
+    except Exception:
+        log.exception("KBO official schedule fetch failed")
+
+    return games
+
+def fetch_npb_official_games():
+    """NPB 공식 월간 상세 일정 페이지에서 오늘 경기를 읽는다."""
+    now_jst = datetime.now(timezone(timedelta(hours=9)))
+    year, month, day = now_jst.year, now_jst.month, now_jst.day
+    url = f"https://npb.jp/games/{year}/schedule_{month:02d}_detail.html"
+    games = []
+
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            log.warning("NPB official schedule HTTP %s", r.status_code)
+            return []
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text("\n", strip=True)
+        lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
+
+        NPB_TEAMS = [
+            "巨人","DeNA","ヤクルト","阪神","広島","中日",
+            "日本ハム","ロッテ","楽天","ソフトバンク","西武","オリックス"
+        ]
+
+        date_re = re.compile(rf'^{month}/{day}(?:（.*?）)?$')
+        active = False
+
+        for i, line in enumerate(lines):
+            if date_re.search(line):
+                active = True
+                continue
+            if active and re.match(r'^\d{1,2}/\d{1,2}', line):
+                break
+            if not active:
+                continue
+
+            mt = re.search(r'([01]?\d|2[0-3]):([0-5]\d)', line)
+            if not mt:
+                continue
+
+            found = [t for t in NPB_TEAMS if t in line]
+
+            # 팀명이 다른 줄에 나뉜 경우 주변 줄까지 결합
+            if len(found) < 2:
+                chunk = " ".join(lines[max(0,i-2):min(len(lines),i+3)])
+                found = [t for t in NPB_TEAMS if t in chunk]
+
+            uniq = []
+            for t in found:
+                if t not in uniq:
+                    uniq.append(t)
+
+            if len(uniq) < 2:
+                continue
+
+            hh, mm = int(mt.group(1)), int(mt.group(2))
+            start_jst = datetime(year, month, day, hh, mm, tzinfo=timezone(timedelta(hours=9)))
+            start_utc = start_jst.astimezone(timezone.utc)
+            ok, mins = _within_prematch_window(start_utc)
+            if not ok:
+                continue
+
+            away, home = uniq[0], uniq[1]
+            games.append({
+                "event_id": f"NPB-{start_jst.strftime('%Y%m%d')}-{away}-{home}",
+                "sport": "baseball",
+                "league": "NPB",
+                "pick_group": "asia_baseball",
+                "home": home,
+                "away": away,
+                "start_utc": start_utc.isoformat(),
+                "minutes_to_start": mins,
+                "source": "NPB official",
+            })
+
+    except Exception:
+        log.exception("NPB official schedule fetch failed")
+
+    # 같은 경기 중복 제거
+    out = {}
+    for g in games:
+        out[g["event_id"]] = g
+    return list(out.values())
+
+def fetch_kleague_official_games():
+    """K리그 공식 일정 페이지를 우선 파싱. 페이지 구조 변경 시 조용히 건너뜀."""
+    now_kst = datetime.now(timezone(timedelta(hours=9)))
+    year, month, day = now_kst.year, now_kst.month, now_kst.day
+    url = "https://www.kleague.com/schedule.do"
+    games = []
+
+    try:
+        r = requests.get(
+            url,
+            params={"leagueId": "1", "year": str(year), "month": f"{month:02d}"},
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code != 200:
+            log.warning("K League official schedule HTTP %s", r.status_code)
+            return []
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        # 표 행 중심 파싱
+        for tr in soup.find_all("tr"):
+            cells = [_clean_team_text(td.get_text(" ", strip=True)) for td in tr.find_all(["th","td"])]
+            if not cells:
+                continue
+            joined = " | ".join(cells)
+
+            # 날짜 확인
+            if not (
+                re.search(rf'\b{month}[./-]0?{day}\b', joined) or
+                re.search(rf'\b0?{day}\b', cells[0] if cells else "")
+            ):
+                continue
+
+            mt = re.search(r'\b([01]?\d|2[0-3]):([0-5]\d)\b', joined)
+            if not mt:
+                continue
+
+            # VS 주변 텍스트에서 팀명 추정
+            # 셀 중 너무 짧거나 시간/날짜/장소만인 값 제외
+            candidates = []
+            for c in cells:
+                if re.search(r'\d{1,2}:\d{2}', c):
+                    continue
+                if re.fullmatch(r'[\d./\-()월일\s]+', c):
+                    continue
+                if len(c) >= 2 and len(c) <= 30:
+                    candidates.append(c)
+
+            # 알려진 K리그1 팀명으로 필터
+            K1 = ["강원","광주","김천","대전","부천","서울","안양","울산","인천","전북","제주","포항"]
+            found = []
+            for team in K1:
+                if team in joined:
+                    found.append(team)
+
+            if len(found) < 2:
+                continue
+
+            hh, mm = int(mt.group(1)), int(mt.group(2))
+            start_kst = datetime(year, month, day, hh, mm, tzinfo=timezone(timedelta(hours=9)))
+            start_utc = start_kst.astimezone(timezone.utc)
+            ok, mins = _within_prematch_window(start_utc)
+            if not ok:
+                continue
+
+            away, home = found[0], found[1]
+            games.append({
+                "event_id": f"KLEAGUE1-{start_kst.strftime('%Y%m%d')}-{away}-{home}",
+                "sport": "soccer",
+                "league": "K League 1",
+                "pick_group": "soccer",
+                "home": home,
+                "away": away,
+                "start_utc": start_utc.isoformat(),
+                "minutes_to_start": mins,
+                "source": "K League official",
+            })
+
+    except Exception:
+        log.exception("K League official schedule fetch failed")
+
+    out = {}
+    for g in games:
+        out[g["event_id"]] = g
+    return list(out.values())
+
+def fetch_domestic_official_games():
+    games = []
+    games.extend(fetch_kbo_official_games())
+    games.extend(fetch_npb_official_games())
+    games.extend(fetch_kleague_official_games())
+
+    # KBL은 8월 현재 비시즌. 존재하지 않는 ESPN 코드 호출은 하지 않음.
+    # 시즌 재개 후 공식 KBL 일정 소스를 별도 연결하면 된다.
+    return games
 
 
 def fetch_major_upcoming_games():
     now = datetime.now(timezone.utc)
-    games = []
+    games = fetch_domestic_official_games()
     date_keys = {
         (now + timedelta(days=d)).strftime("%Y%m%d")
         for d in (-1, 0, 1, 2)
@@ -833,8 +1120,6 @@ def fetch_major_upcoming_games():
             try:
                 r = requests.get(url, params={"dates": date_key}, timeout=15)
                 if r.status_code != 200:
-                    if league_name in ("KBO", "NPB", "KBL", "K League 1"):
-                        log.info("Schedule source unavailable | %s | HTTP %s", league_name, r.status_code)
                     continue
 
                 data = r.json()
@@ -1408,6 +1693,11 @@ def settle_finished_picks(conn):
     for row in rows:
         event_id, league, home_team, away_team, pick_team, probability = row
 
+        # 해외 메이저는 ESPN summary로 자동 결과판정.
+        # KBO/NPB/K리그 공식 결과 파서는 다음 단계에서 별도 확장 가능.
+        if league in ("KBO", "NPB", "K League 1", "KBL"):
+            continue
+
         result = fetch_event_result(event_id, league)
         if not result:
             continue
@@ -1467,7 +1757,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v8 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v8.2 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
