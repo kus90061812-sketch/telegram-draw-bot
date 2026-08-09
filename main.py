@@ -34,6 +34,8 @@ PREMATCH_MIN_MINUTES = int(os.getenv("PREMATCH_MIN_MINUTES", "90"))
 PREMATCH_MAX_MINUTES = int(os.getenv("PREMATCH_MAX_MINUTES", "240"))
 MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "4"))
 MIN_NEWS_EDGE = int(os.getenv("MIN_NEWS_EDGE", "58"))
+ENABLE_FREE_TEAM_DATA = os.getenv("ENABLE_FREE_TEAM_DATA", "true").lower() == "true"
+RECENT_GAMES_LOOKBACK = int(os.getenv("RECENT_GAMES_LOOKBACK", "5"))
 
 ENABLE_RESULT_POSTS = os.getenv("ENABLE_RESULT_POSTS", "true").lower() == "true"
 
@@ -395,6 +397,220 @@ def collect_entries():
     )
 
 
+
+# =========================
+# FREE TEAM / GAME DATA
+# =========================
+def espn_scoreboard_url(sport, league):
+    return f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+
+def league_code_from_name(name):
+    for sport, league, league_name in MAJOR_LEAGUES:
+        if league_name == name:
+            return sport, league
+    return None, None
+
+def fetch_recent_team_games(team_name, sport, league, lookback=5):
+    """최근 며칠 scoreboard에서 해당 팀 경기 결과를 찾아 간단한 폼 지표를 만든다."""
+    now = datetime.now(timezone.utc)
+    found = []
+
+    # 넉넉하게 과거 20일 확인
+    for d in range(1, 21):
+        if len(found) >= lookback:
+            break
+
+        date_key = (now - timedelta(days=d)).strftime("%Y%m%d")
+        try:
+            r = requests.get(
+                espn_scoreboard_url(sport, league),
+                params={"dates": date_key},
+                timeout=12
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+
+            for ev in data.get("events", []):
+                comps = ev.get("competitions") or []
+                if not comps:
+                    continue
+                comp = comps[0]
+                status = ((comp.get("status") or {}).get("type") or {})
+                if not status.get("completed"):
+                    continue
+
+                competitors = comp.get("competitors") or []
+                team_row = opp_row = None
+
+                for c in competitors:
+                    t = c.get("team") or {}
+                    name = t.get("displayName") or t.get("name") or ""
+                    if same_team(name, team_name):
+                        team_row = c
+                    else:
+                        opp_row = c
+
+                if not team_row or not opp_row:
+                    continue
+
+                try:
+                    team_score = int(float(team_row.get("score", 0)))
+                    opp_score = int(float(opp_row.get("score", 0)))
+                except Exception:
+                    continue
+
+                found.append({
+                    "date": ev.get("date", ""),
+                    "team_score": team_score,
+                    "opp_score": opp_score,
+                    "win": team_score > opp_score,
+                    "loss": team_score < opp_score,
+                    "draw": team_score == opp_score,
+                })
+
+                if len(found) >= lookback:
+                    break
+
+        except Exception:
+            log.exception("Recent games fetch failed | %s | %s", team_name, date_key)
+
+    wins = sum(1 for g in found if g["win"])
+    losses = sum(1 for g in found if g["loss"])
+    draws = sum(1 for g in found if g["draw"])
+    pts_for = sum(g["team_score"] for g in found)
+    pts_against = sum(g["opp_score"] for g in found)
+
+    return {
+        "games": len(found),
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "points_for": pts_for,
+        "points_against": pts_against,
+        "avg_for": round(pts_for / len(found), 2) if found else 0,
+        "avg_against": round(pts_against / len(found), 2) if found else 0,
+    }
+
+def fetch_summary_team_context(event_id, sport, league):
+    """summary 응답에서 가능한 범위의 부상/로스터/선수 정보 텍스트를 추출."""
+    url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/summary"
+    try:
+        r = requests.get(url, params={"event": event_id}, timeout=12)
+        if r.status_code != 200:
+            return {}
+
+        data = r.json()
+        context = {
+            "injuries": [],
+            "leaders": [],
+            "notes": [],
+        }
+
+        injuries = data.get("injuries") or []
+        for group in injuries[:10]:
+            team = (group.get("team") or {}).get("displayName") or ""
+            for inj in group.get("injuries", [])[:10]:
+                athlete = (inj.get("athlete") or {}).get("displayName") or ""
+                status = inj.get("status") or ""
+                detail = ((inj.get("details") or {}).get("detail")) or ""
+                if athlete:
+                    context["injuries"].append({
+                        "team": team,
+                        "athlete": athlete,
+                        "status": status,
+                        "detail": detail[:180],
+                    })
+
+        leaders = data.get("leaders") or []
+        for group in leaders[:10]:
+            team = (group.get("team") or {}).get("displayName") or ""
+            for cat in group.get("leaders", [])[:6]:
+                name = cat.get("name") or cat.get("displayName") or ""
+                leaders_list = cat.get("leaders") or []
+                if leaders_list:
+                    ath = (leaders_list[0].get("athlete") or {}).get("displayName") or ""
+                    value = leaders_list[0].get("displayValue") or ""
+                    if ath:
+                        context["leaders"].append({
+                            "team": team,
+                            "category": name,
+                            "athlete": ath,
+                            "value": value,
+                        })
+
+        notes = data.get("news") or []
+        for n in notes[:5]:
+            h = n.get("headline") or ""
+            if h:
+                context["notes"].append(h[:220])
+
+        return context
+    except Exception:
+        log.exception("Summary context fetch failed | %s", event_id)
+        return {}
+
+def build_free_game_context(games):
+    if not ENABLE_FREE_TEAM_DATA:
+        return games
+
+    out = []
+    for g in games:
+        sport, league = league_code_from_name(g["league"])
+        item = dict(g)
+
+        try:
+            item["home_recent"] = fetch_recent_team_games(
+                g["home"], sport, league, RECENT_GAMES_LOOKBACK
+            )
+        except Exception:
+            item["home_recent"] = {}
+
+        try:
+            item["away_recent"] = fetch_recent_team_games(
+                g["away"], sport, league, RECENT_GAMES_LOOKBACK
+            )
+        except Exception:
+            item["away_recent"] = {}
+
+        try:
+            item["event_context"] = fetch_summary_team_context(
+                g["event_id"], sport, league
+            )
+        except Exception:
+            item["event_context"] = {}
+
+        out.append(item)
+
+    return out
+
+def basic_model_score(game):
+    """AI 전에 최소한의 수치 기반 기준점을 만든다.
+    최근 경기 성적과 득실만 사용. 50 기준, -12~+12 범위."""
+    home = game.get("home_recent") or {}
+    away = game.get("away_recent") or {}
+
+    if not home.get("games") or not away.get("games"):
+        return 50.0
+
+    home_games = max(home["games"], 1)
+    away_games = max(away["games"], 1)
+
+    home_winrate = home["wins"] / home_games
+    away_winrate = away["wins"] / away_games
+
+    home_diff = home.get("avg_for", 0) - home.get("avg_against", 0)
+    away_diff = away.get("avg_for", 0) - away.get("avg_against", 0)
+
+    raw = 50
+    raw += (home_winrate - away_winrate) * 12
+    raw += max(-5, min(5, (home_diff - away_diff) * 1.5))
+
+    # 홈 어드밴티지 소폭
+    raw += 1.5
+
+    return round(max(38, min(62, raw)), 1)
+
 # =========================
 # OPENAI NEWS
 # =========================
@@ -715,6 +931,10 @@ def select_prematch_top_picks(games, news_items):
     if not games or len(news_items) < 3:
         return []
 
+    games = build_free_game_context(games)
+    for g in games:
+        g["base_home_edge"] = basic_model_score(g)
+
     news = []
     for i, n in enumerate(news_items[:100], 1):
         news.append({
@@ -744,7 +964,9 @@ def select_prematch_top_picks(games, news_items):
 - 최대 4경기.
 - 가장 근거가 강하고 한쪽 우세가 뚜렷한 순서.
 - 억지로 4개를 채우지 않는다.
-- probability는 실제 통계 승률이 아니라 '뉴스 기반 AI 우세도'.
+- probability는 실제 통계 승률이 아니라 '무료 경기 데이터 + 뉴스 기반 AI 추정 우세도'.
+- base_home_edge는 최근 경기 성적/득실만으로 계산한 홈팀 기준점이다.
+- base_home_edge를 무시하지 말되, 부상/결장/라인업 뉴스가 강하면 조정할 수 있다.
 - probability는 {MIN_NEWS_EDGE}~75 정수.
 - confidence는 high 또는 medium.
 - pick_side는 반드시 "home" 또는 "away".
@@ -850,11 +1072,11 @@ def format_prematch_pick(pick, news_items):
         f"🏟 <b>{html.escape(g['away'])} vs {html.escape(g['home'])}</b>\n"
         f"⏰ 경기 시작: {start_kst.strftime('%m/%d %H:%M')} KST\n\n"
         f"✅ 예상 승리팀: <b>{html.escape(pick['pick_team'])}</b>\n"
-        f"📊 뉴스 기반 예상 우세도: <b>{pick['probability']}%</b>\n"
+        f"📊 데이터+뉴스 예상 우세도: <b>{pick['probability']}%</b>\n"
         f"🔎 신뢰도: <b>{conf}</b>\n\n"
         f"<b>분석 근거</b>\n{reasons}\n\n"
         f"<b>관련 기사</b>\n{sources}\n\n"
-        f"⚠️ 뉴스 정보만으로 산출한 AI 추정치이며 실제 통계적 승률이나 결과 보장이 아닙니다."
+        f"⚠️ 무료 경기 데이터와 뉴스 기반 AI 추정치이며 실제 배당모델의 확정 승률이나 결과 보장이 아닙니다."
     )
 
 
@@ -1086,7 +1308,7 @@ def format_result_post(row, result, final_status, stats):
         f"🏟 <b>{html.escape(away_team)} {result['away_score']} : "
         f"{result['home_score']} {html.escape(home_team)}</b>\n\n"
         f"🎯 사전 PICK: <b>{html.escape(pick_team)}</b>\n"
-        f"📊 뉴스 기반 예상 우세도: <b>{probability}%</b>\n"
+        f"📊 데이터+뉴스 예상 우세도: <b>{probability}%</b>\n"
         f"📌 결과: <b>{icon}</b>\n\n"
         f"📈 최근 24시간: {stats['today_hit']}승 {stats['today_miss']}패 "
         f"({today_rate:.1f}%)\n"
@@ -1172,7 +1394,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v6.2 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v7 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
