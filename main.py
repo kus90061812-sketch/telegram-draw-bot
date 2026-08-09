@@ -933,6 +933,22 @@ def settle_finished_picks(conn):
         except Exception:
             log.exception("Result post failed | %s", event_id)
 
+
+def seed_existing(conn):
+    """첫 실행 시 현재 RSS의 기존 기사를 전송하지 않고 DB에 기록한다."""
+    items = collect_entries()
+    for item in items:
+        try:
+            cache_article(conn, item)
+        except Exception:
+            log.exception("Article cache failed during seed: %s", item["title"])
+
+        fp = fingerprint(item["title"], item["link"])
+        mark_sent(conn, fp, item["title"], item["link"])
+
+    log.info("첫 실행: 기존 기사 %d건 스킵 처리", len(items))
+
+
 def main():
     conn = db()
 

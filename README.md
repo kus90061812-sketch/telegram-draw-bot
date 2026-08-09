@@ -1,3 +1,8 @@
+# SportNow v6.1 FIX
+
+v6에서 누락된 `seed_existing()` 함수를 복구한 수정본입니다.
+GitHub의 기존 파일을 이 ZIP 내용으로 교체하고 Railway에서 Redeploy 하세요.
+
 # SportNow v6 — PostgreSQL + 자동 적중 결과
 
 ## 추가된 기능
