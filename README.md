@@ -1,57 +1,31 @@
-# SportNow v6.1 FIX
+# SportNow v6.2 CLEAN
 
-v6에서 누락된 `seed_existing()` 함수를 복구한 수정본입니다.
-GitHub의 기존 파일을 이 ZIP 내용으로 교체하고 Railway에서 Redeploy 하세요.
+이전 v6.x의 함수 누락 문제를 피하기 위해 main.py를 통째로 다시 정리한 버전입니다.
 
-# SportNow v6 — PostgreSQL + 자동 적중 결과
+포함 기능:
+- 국내/해외 스포츠 뉴스 RSS 수집
+- 해외뉴스 한국어 자동번역 + 요약
+- 국내뉴스 요약
+- 유사 기사 중복 차단
+- 하루 뉴스 최대 40건
+- PostgreSQL 저장
+- 메이저 리그만 프리매치 분석
+  - EPL / La Liga / Bundesliga / Serie A / Ligue 1 / UCL
+  - MLB / NBA / NFL / NHL
+- 경기 시작 90~240분 전만 후보
+- 뉴스 근거가 충분한 경기 중 하루 최대 4픽
+- 경기 종료 후 자동 결과 조회
+- 적중/미적중 자동 게시
+- 최근 24시간 + 누적 적중률
 
-## 추가된 기능
-- Railway PostgreSQL 지원
-- 픽별 event_id / 리그 / 홈·원정 / 선택팀 / 우세도 저장
-- 경기 종료 후 최종 스코어 자동 조회
-- 적중 / 미적중 / 무승부 자동 판정
-- 결과를 Telegram 채널에 자동 게시
-- 최근 24시간 성적 + 누적 성적 / 적중률 자동 표시
-- 재배포해도 PostgreSQL에 기록 유지
-
-## Railway 설정
-
-### 1) PostgreSQL 추가
-Railway 프로젝트에서:
-New → Database → Add PostgreSQL
-
-추가하면 일반적으로 `DATABASE_URL` 변수가 만들어집니다.
-봇 서비스 Variables에서도 DATABASE_URL을 참조/연결하세요.
-
-### 2) Variables
-기존 변수 + 아래를 확인하세요.
-
-DATABASE_URL=Railway PostgreSQL 연결주소
-ENABLE_RESULT_POSTS=true
-
+Railway Variables:
+DATABASE_URL=${{Postgres.DATABASE_URL}}
 ENABLE_NEWS_PICKS=true
 PREMATCH_MIN_MINUTES=90
 PREMATCH_MAX_MINUTES=240
 MAX_PICKS_PER_DAY=4
+MIN_NEWS_EDGE=58
+ENABLE_RESULT_POSTS=true
 
-### 3) SQL
-`schema.sql`을 제공합니다.
-하지만 main.py가 시작될 때 필요한 테이블을 자동 생성하므로 보통 직접 실행할 필요는 없습니다.
-
-## 결과 게시 예시
-
-🏁 SPORT NOW PICK RESULT
-
-🏆 MLB
-San Diego Padres 3 : 6 Los Angeles Dodgers
-
-🎯 사전 PICK: Los Angeles Dodgers
-📊 뉴스 기반 우세도: 68%
-📌 결과: ✅ 적중
-
-📈 최근 24시간: 3승 1패 (75.0%)
-📚 누적: 38승 21패 (64.4%)
-
-## 주의
-현재 픽의 %는 뉴스 기반 AI 추정 우세도이며,
-배당/공식 통계 모델의 실제 승률이 아닙니다.
+중요:
+표시되는 %는 뉴스 기반 AI 추정 우세도이며, 배당/정식 통계모델의 실제 승률은 아닙니다.
