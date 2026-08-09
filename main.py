@@ -1400,6 +1400,9 @@ def select_prematch_top_picks(games, news_items):
 - pick_side는 반드시 "home" 또는 "away".
 - source_ids는 제공된 기사 ID만.
 - comment는 2~3문장으로, 왜 이 팀이 우세하다고 판단했는지 자연스럽게 설명한다.
+- 분석 근거와 comment에 baseball_model, base_home_edge, source_ids, event_id 같은 내부 변수명을 절대 쓰지 않는다.
+- 기사 번호(ID 1, ID 59 같은 표기)를 문장에 절대 쓰지 않는다.
+- 팀명을 문장에 쓸 때는 가능한 한 자연스러운 한국어 팀명으로 표현한다.
 - 과장 표현, 확정적 표현, 결과 보장 표현은 금지.
 - JSON 배열만 출력.
 
@@ -1489,6 +1492,57 @@ def select_prematch_top_picks(games, news_items):
     return final
 
 
+
+TEAM_KO = {
+    "Arizona Diamondbacks":"애리조나 다이아몬드백스","Atlanta Braves":"애틀랜타 브레이브스",
+    "Baltimore Orioles":"볼티모어 오리올스","Boston Red Sox":"보스턴 레드삭스",
+    "Chicago Cubs":"시카고 컵스","Chicago White Sox":"시카고 화이트삭스",
+    "Cincinnati Reds":"신시내티 레즈","Cleveland Guardians":"클리블랜드 가디언스",
+    "Colorado Rockies":"콜로라도 로키스","Detroit Tigers":"디트로이트 타이거스",
+    "Houston Astros":"휴스턴 애스트로스","Kansas City Royals":"캔자스시티 로열스",
+    "Los Angeles Angels":"LA 에인절스","Los Angeles Dodgers":"LA 다저스",
+    "Miami Marlins":"마이애미 말린스","Milwaukee Brewers":"밀워키 브루어스",
+    "Minnesota Twins":"미네소타 트윈스","New York Mets":"뉴욕 메츠",
+    "New York Yankees":"뉴욕 양키스","Athletics":"애슬레틱스",
+    "Philadelphia Phillies":"필라델피아 필리스","Pittsburgh Pirates":"피츠버그 파이리츠",
+    "San Diego Padres":"샌디에이고 파드리스","San Francisco Giants":"샌프란시스코 자이언츠",
+    "Seattle Mariners":"시애틀 매리너스","St. Louis Cardinals":"세인트루이스 카디널스",
+    "Tampa Bay Rays":"탬파베이 레이스","Texas Rangers":"텍사스 레인저스",
+    "Toronto Blue Jays":"토론토 블루제이스","Washington Nationals":"워싱턴 내셔널스",
+    "Arsenal":"아스널","Chelsea":"첼시","Liverpool":"리버풀","Manchester City":"맨체스터 시티",
+    "Manchester United":"맨체스터 유나이티드","Tottenham Hotspur":"토트넘 홋스퍼",
+    "Real Madrid":"레알 마드리드","Barcelona":"바르셀로나","Bayern Munich":"바이에른 뮌헨",
+    "Borussia Dortmund":"보루시아 도르트문트","Inter Milan":"인터 밀란","AC Milan":"AC 밀란",
+    "Juventus":"유벤투스","Napoli":"나폴리","Paris Saint-Germain":"파리 생제르맹",
+    "LG":"LG 트윈스","HANWHA":"한화 이글스","SSG":"SSG 랜더스","SAMSUNG":"삼성 라이온즈",
+    "NC":"NC 다이노스","KT":"KT 위즈","LOTTE":"롯데 자이언츠","KIA":"KIA 타이거즈",
+    "DOOSAN":"두산 베어스","KIWOOM":"키움 히어로즈",
+    "巨人":"요미우리 자이언츠","DeNA":"요코하마 DeNA 베이스타스","ヤクルト":"야쿠르트 스왈로스",
+    "阪神":"한신 타이거스","広島":"히로시마 도요 카프","中日":"주니치 드래곤즈",
+    "日本ハム":"닛폰햄 파이터스","ロッテ":"지바 롯데 마린스","楽天":"라쿠텐 골든이글스",
+    "ソフトバンク":"소프트뱅크 호크스","西武":"세이부 라이온즈","オリックス":"오릭스 버팔로스",
+    "강원":"강원FC","광주":"광주FC","김천":"김천상무","대전":"대전하나시티즌",
+    "부천":"부천FC 1995","서울":"FC서울","안양":"FC안양","울산":"울산 HD",
+    "인천":"인천 유나이티드","전북":"전북 현대","제주":"제주 SK","포항":"포항 스틸러스",
+}
+
+def ko_team(name):
+    name = str(name or "").strip()
+    return TEAM_KO.get(name, name)
+
+def clean_analysis_text(text):
+    text = str(text or "")
+    for a,b in {
+        "baseball_model":"야구 종합 지표",
+        "base_home_edge":"최근 흐름 지표",
+        "home_prime_score":"홈팀 우세 지표",
+        "away_prime_score":"원정팀 우세 지표",
+    }.items():
+        text = text.replace(a,b)
+    text = re.sub(r"\s*\(?ID\s*\d+\)?", "", text, flags=re.I)
+    text = re.sub(r"\s*\[ID\s*\d+\]", "", text, flags=re.I)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
 def format_prematch_pick(pick, news_items):
     g = pick["_game"]
     start_kst = datetime.fromisoformat(g["start_utc"]).astimezone(
@@ -1496,7 +1550,7 @@ def format_prematch_pick(pick, news_items):
     )
 
     reasons = "\n".join(
-        f"• {html.escape(str(r))}"
+        f"• {html.escape(clean_analysis_text(str(r)))}"
         for r in pick.get("reasons", [])[:3]
     )
 
@@ -1519,14 +1573,14 @@ def format_prematch_pick(pick, news_items):
     return (
         f"⚡ <b>SPORT NOW PRIME PICK</b>\n\n"
         f"🏆 {html.escape(g['league'])}\n"
-        f"🏟 <b>{html.escape(g['away'])} vs {html.escape(g['home'])}</b>\n"
+        f"🏟 <b>{html.escape(ko_team(g['away']))} vs {html.escape(ko_team(g['home']))}</b>\n"
         f"⏰ 경기 시작: {start_kst.strftime('%m/%d %H:%M')} KST\n\n"
-        f"🎯 모델 선택: <b>{html.escape(pick['pick_team'])}</b>\n"
+        f"🎯 모델 선택: <b>{html.escape(ko_team(pick['pick_team']))}</b>\n"
         f"📈 PRIME SCORE: <b>{pick['probability']}%</b>\n"
         f"🔎 신뢰도: <b>{conf}</b>\n⏱ 경기 약 1시간 전 최종 분석\n\n"
         f"<b>분석 근거</b>\n{reasons}\n\n"
         f"💬 <b>PRIME COMMENT</b>\n"
-        f"{html.escape(str(pick.get('comment') or '현재 확인 가능한 경기 전 정보 기준으로 우세한 흐름이 감지됩니다.'))}\n\n"
+        f"{html.escape(clean_analysis_text(str(pick.get('comment') or '현재 확인 가능한 경기 전 정보 기준으로 우세한 흐름이 감지됩니다.')))}\n\n"
         + (
             f"⚾ <b>BASEBALL MODEL</b>\n"
             f"선발 30% · 타선 25% · 불펜 20% · 최근 흐름 15% · 라인업/결장 10%\n\n"
@@ -1806,9 +1860,9 @@ def format_result_post(row, result, final_status, stats):
     return (
         f"🏁 <b>SPORT NOW PRIME RESULT</b>\n\n"
         f"🏆 {html.escape(league)}\n"
-        f"🏟 <b>{html.escape(away_team)} {result['away_score']} : "
-        f"{result['home_score']} {html.escape(home_team)}</b>\n\n"
-        f"🎯 PRIME PICK: <b>{html.escape(pick_team)}</b>\n"
+        f"🏟 <b>{html.escape(ko_team(away_team))} {result['away_score']} : "
+        f"{result['home_score']} {html.escape(ko_team(home_team))}</b>\n\n"
+        f"🎯 PRIME PICK: <b>{html.escape(ko_team(pick_team))}</b>\n"
         f"📈 PRIME SCORE: <b>{probability}%</b>\n"
         f"📌 결과: <b>{icon}</b>\n\n"
         f"💬 <b>RESULT COMMENT</b>\n{result_comment}\n\n"
@@ -1901,7 +1955,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v10 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v10.1 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
