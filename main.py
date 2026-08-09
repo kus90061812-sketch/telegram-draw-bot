@@ -41,6 +41,12 @@ MAX_PICKS_PER_GROUP = int(os.getenv("MAX_PICKS_PER_GROUP", "2"))
 
 ENABLE_RESULT_POSTS = os.getenv("ENABLE_RESULT_POSTS", "true").lower() == "true"
 POST_NEWS_PUBLICLY = os.getenv("POST_NEWS_PUBLICLY", "false").lower() == "true"
+BASEBALL_STARTER_WEIGHT = float(os.getenv("BASEBALL_STARTER_WEIGHT", "0.30"))
+BASEBALL_OFFENSE_WEIGHT = float(os.getenv("BASEBALL_OFFENSE_WEIGHT", "0.25"))
+BASEBALL_BULLPEN_WEIGHT = float(os.getenv("BASEBALL_BULLPEN_WEIGHT", "0.20"))
+BASEBALL_FORM_WEIGHT = float(os.getenv("BASEBALL_FORM_WEIGHT", "0.15"))
+BASEBALL_LINEUP_WEIGHT = float(os.getenv("BASEBALL_LINEUP_WEIGHT", "0.10"))
+
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = os.getenv("DB_PATH", "sports_news.db")
@@ -1229,6 +1235,112 @@ def event_pick_exists(conn, event_id):
     return row is not None
 
 
+
+def clamp(v, lo=0.0, hi=100.0):
+    return max(lo, min(hi, float(v)))
+
+def recent_form_component(game, side):
+    recent = game.get(f"{side}_recent") or {}
+    games = recent.get("games", 0) or 0
+    if not games:
+        return 50.0
+    winrate = recent.get("wins", 0) / games
+    run_diff = (recent.get("avg_for", 0) or 0) - (recent.get("avg_against", 0) or 0)
+    return clamp(50 + (winrate - 0.5) * 40 + max(-12, min(12, run_diff * 3)))
+
+def news_side_signals(game, news_items):
+    result = {
+        "home": {"starter": 50, "offense": 50, "bullpen": 50, "lineup": 50},
+        "away": {"starter": 50, "offense": 50, "bullpen": 50, "lineup": 50},
+    }
+
+    positive = ["복귀", "호투", "선발 확정", "라인업 복귀", "타격감", "홈런",
+                "return", "healthy", "starting", "hot streak", "activated"]
+    negative = ["부상", "결장", "이탈", "휴식", "부진", "불펜 소모", "등판 불가",
+                "injury", "out", "rest", "sidelined", "fatigue", "unavailable"]
+    categories = {
+        "starter": ["선발", "투수", "starter", "pitcher"],
+        "bullpen": ["불펜", "마무리", "bullpen", "closer", "reliever"],
+        "offense": ["타선", "타자", "타격", "홈런", "offense", "hitter", "batting"],
+        "lineup": ["라인업", "결장", "복귀", "선발명단", "lineup", "injury", "return", "rest"],
+    }
+
+    for n in news_items[:100]:
+        text = f'{n.get("title","")} {n.get("summary","")}'.lower()
+        for side in ("home", "away"):
+            team = str(game.get(side, "")).lower()
+            if not team or team not in text:
+                continue
+
+            delta = 0
+            if any(k.lower() in text for k in positive):
+                delta += 5
+            if any(k.lower() in text for k in negative):
+                delta -= 7
+
+            for cat, keys in categories.items():
+                if any(k.lower() in text for k in keys):
+                    result[side][cat] = clamp(result[side][cat] + delta)
+
+    return result
+
+def baseball_model_score(game, news_items):
+    """KBO/NPB/MLB 전용 상대 우세 모델.
+    값은 승률이 아니라 0~100 PRIME SCORE."""
+    signals = news_side_signals(game, news_items)
+    hr = game.get("home_recent") or {}
+    ar = game.get("away_recent") or {}
+
+    def offense_component(recent, news_score):
+        base = 50
+        if recent.get("games"):
+            base += ((recent.get("avg_for", 0) or 0) - 4.0) * 4
+        return clamp(base * 0.65 + news_score * 0.35)
+
+    def bullpen_component(recent, news_score):
+        base = 50
+        if recent.get("games"):
+            base += (4.0 - (recent.get("avg_against", 0) or 0)) * 3
+        return clamp(base * 0.55 + news_score * 0.45)
+
+    home_components = {
+        "starter": signals["home"]["starter"],
+        "offense": offense_component(hr, signals["home"]["offense"]),
+        "bullpen": bullpen_component(hr, signals["home"]["bullpen"]),
+        "form": recent_form_component(game, "home"),
+        "lineup": signals["home"]["lineup"],
+    }
+    away_components = {
+        "starter": signals["away"]["starter"],
+        "offense": offense_component(ar, signals["away"]["offense"]),
+        "bullpen": bullpen_component(ar, signals["away"]["bullpen"]),
+        "form": recent_form_component(game, "away"),
+        "lineup": signals["away"]["lineup"],
+    }
+
+    weights = {
+        "starter": BASEBALL_STARTER_WEIGHT,
+        "offense": BASEBALL_OFFENSE_WEIGHT,
+        "bullpen": BASEBALL_BULLPEN_WEIGHT,
+        "form": BASEBALL_FORM_WEIGHT,
+        "lineup": BASEBALL_LINEUP_WEIGHT,
+    }
+
+    home_raw = sum(home_components[k] * weights[k] for k in weights)
+    away_raw = sum(away_components[k] * weights[k] for k in weights)
+    diff = home_raw - away_raw
+
+    home_score = clamp(50 + diff * 0.9, 35, 75)
+    away_score = 100 - home_score
+
+    return {
+        "home_prime_score": round(home_score, 1),
+        "away_prime_score": round(away_score, 1),
+        "home_components": {k: round(v, 1) for k, v in home_components.items()},
+        "away_components": {k: round(v, 1) for k, v in away_components.items()},
+    }
+
+
 def select_prematch_top_picks(games, news_items):
     if not games or len(news_items) < 3:
         return []
@@ -1236,6 +1348,8 @@ def select_prematch_top_picks(games, news_items):
     games = build_free_game_context(games)
     for g in games:
         g["base_home_edge"] = basic_model_score(g)
+        if g.get("sport") == "baseball" or g.get("league") in ("KBO", "NPB", "MLB"):
+            g["baseball_model"] = baseball_model_score(g, news_items)
 
     news = []
     for i, n in enumerate(news_items[:100], 1):
@@ -1271,7 +1385,13 @@ def select_prematch_top_picks(games, news_items):
 - 애매하면 빈 배열 []을 출력해도 된다.
 - probability는 실제 통계 승률이 아니라 '무료 경기 데이터 + 뉴스 기반 AI 추정 우세도'.
 - base_home_edge는 최근 경기 성적/득실만으로 계산한 홈팀 기준점이다.
-- base_home_edge를 무시하지 말되, 부상/결장/라인업 뉴스가 강하면 조정할 수 있다.
+- 야구 경기에는 baseball_model이 제공된다.
+- KBO/NPB/MLB는 반드시 baseball_model을 우선 참고한다.
+- 야구 가중치는 선발 30%, 타선 25%, 불펜 20%, 최근 팀 흐름 15%, 라인업/결장/기타 10%다.
+- 선발투수 하나만으로 승부를 판단하지 않는다.
+- 경기 시작 전 확인할 수 없는 '오늘 컨디션'은 추측하지 않는다.
+- component 차이가 작으면 강한 확신을 내리지 않는다.
+- 확정 부상/결장/라인업 정보가 강하면 조정할 수 있다.
 - probability는 {MIN_NEWS_EDGE}~75 정수.
 - confidence는 high 또는 medium.
 - probability가 55 미만인 경기는 절대 출력하지 않는다.
@@ -1402,13 +1522,19 @@ def format_prematch_pick(pick, news_items):
         f"🏟 <b>{html.escape(g['away'])} vs {html.escape(g['home'])}</b>\n"
         f"⏰ 경기 시작: {start_kst.strftime('%m/%d %H:%M')} KST\n\n"
         f"🎯 모델 선택: <b>{html.escape(pick['pick_team'])}</b>\n"
-        f"📈 PRIME CONFIDENCE: <b>{pick['probability']}%</b>\n"
+        f"📈 PRIME SCORE: <b>{pick['probability']}%</b>\n"
         f"🔎 신뢰도: <b>{conf}</b>\n⏱ 경기 약 1시간 전 최종 분석\n\n"
         f"<b>분석 근거</b>\n{reasons}\n\n"
         f"💬 <b>PRIME COMMENT</b>\n"
         f"{html.escape(str(pick.get('comment') or '현재 확인 가능한 경기 전 정보 기준으로 우세한 흐름이 감지됩니다.'))}\n\n"
-        f"<b>관련 기사</b>\n{sources}\n\n"
-        f"⚠️ 경기 전 공개 데이터와 최신 팀 정보를 종합한 모델 추정치이며 결과를 보장하지 않습니다."
+        + (
+            f"⚾ <b>BASEBALL MODEL</b>\n"
+            f"선발 30% · 타선 25% · 불펜 20% · 최근 흐름 15% · 라인업/결장 10%\n\n"
+            if g.get("sport") == "baseball" or g.get("league") in ("KBO","NPB","MLB")
+            else ""
+        )
+        + f"<b>관련 기사</b>\n{sources}\n\n"
+        f"⚠️ PRIME SCORE는 실제 승률이 아니라 경기 전 공개 데이터와 최신 팀 정보를 종합한 상대우세 지표이며 결과를 보장하지 않습니다."
     )
 
 
@@ -1683,7 +1809,7 @@ def format_result_post(row, result, final_status, stats):
         f"🏟 <b>{html.escape(away_team)} {result['away_score']} : "
         f"{result['home_score']} {html.escape(home_team)}</b>\n\n"
         f"🎯 PRIME PICK: <b>{html.escape(pick_team)}</b>\n"
-        f"📈 PRIME CONFIDENCE: <b>{probability}%</b>\n"
+        f"📈 PRIME SCORE: <b>{probability}%</b>\n"
         f"📌 결과: <b>{icon}</b>\n\n"
         f"💬 <b>RESULT COMMENT</b>\n{result_comment}\n\n"
         f"📈 최근 24시간: {stats['today_hit']}승 {stats['today_miss']}패 "
@@ -1775,7 +1901,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v9 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v10 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),

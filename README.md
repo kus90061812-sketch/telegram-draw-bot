@@ -1,34 +1,25 @@
-# SPORT NOW v9 — Picks Only + Prime Comment
+# SPORT NOW v10 — Baseball Weighted Model
 
-채널에는 아래만 공개합니다.
-- PRIME PICK
-- PRIME COMMENT
-- PRIME RESULT
-- RESULT COMMENT
-- 누적 적중률
+야구(KBO/NPB/MLB)는 별도 모델로 평가합니다.
 
-뉴스는 채널에 올리지 않고 내부에서 계속 수집해 분석 재료로만 사용합니다.
+가중치:
+- 선발 30%
+- 타선 25%
+- 불펜 20%
+- 최근 팀 흐름 15%
+- 라인업/결장/기타 10%
 
-## PICK 게시 형식
-- 모델 선택
-- PRIME CONFIDENCE
-- 분석 근거
-- PRIME COMMENT 2~3문장
-- 관련 기사
-- 경기 시작시간
+원칙:
+- 선발 하나만 보고 픽하지 않음
+- 경기 전 알 수 없는 '당일 컨디션'은 추측하지 않음
+- PRIME SCORE는 실제 승률이 아니라 상대 우세 지표
+- 최소 게시 기준 55 유지
+- 뉴스는 공개하지 않고 내부 분석 재료로만 사용
+- 경기 종료 후 적중/미적중과 누적 기록 유지
 
-## RESULT 게시 형식
-- 최종 스코어
-- PRIME PICK
-- 적중/미적중
-- RESULT COMMENT
-- 최근 24시간 적중률
-- 누적 적중률
-
-## Railway
-POST_NEWS_PUBLICLY=false
-PREMATCH_MIN_MINUTES=45
-PREMATCH_MAX_MINUTES=70
-MIN_NEWS_EDGE=55
-ENABLE_NEWS_PICKS=true
-ENABLE_RESULT_POSTS=true
+Railway 추가:
+BASEBALL_STARTER_WEIGHT=0.30
+BASEBALL_OFFENSE_WEIGHT=0.25
+BASEBALL_BULLPEN_WEIGHT=0.20
+BASEBALL_FORM_WEIGHT=0.15
+BASEBALL_LINEUP_WEIGHT=0.10
