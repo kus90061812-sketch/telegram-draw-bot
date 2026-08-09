@@ -550,10 +550,20 @@ def fetch_summary_team_context(event_id, sport, league):
                         })
 
         notes = data.get("news") or []
+
+        # ESPN summary의 news 필드는 리그/경기에 따라 list 또는 dict 형태가 올 수 있음.
+        if isinstance(notes, dict):
+            # 흔한 구조: {"articles": [...]} / {"items": [...]}
+            notes = notes.get("articles") or notes.get("items") or notes.get("news") or []
+        elif not isinstance(notes, list):
+            notes = []
+
         for n in notes[:5]:
-            h = n.get("headline") or ""
+            if not isinstance(n, dict):
+                continue
+            h = n.get("headline") or n.get("title") or ""
             if h:
-                context["notes"].append(h[:220])
+                context["notes"].append(str(h)[:220])
 
         return context
     except Exception:
@@ -1955,7 +1965,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v10.1 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v10.2 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
