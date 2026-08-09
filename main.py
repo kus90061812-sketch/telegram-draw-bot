@@ -18,7 +18,8 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@sportnow0")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "8"))
+MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "5"))
+DAILY_POST_LIMIT = int(os.getenv("DAILY_POST_LIMIT", "40"))
 FIRST_RUN_SKIP_EXISTING = os.getenv("FIRST_RUN_SKIP_EXISTING", "true").lower() == "true"
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 DB_PATH = os.getenv("DB_PATH", "sports_news.db")
@@ -77,6 +78,30 @@ def db():
 def fingerprint(title: str, link: str) -> str:
     raw = f"{title.strip().lower()}|{link.strip()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def normalize_words(title):
+    return set(re.findall(r"[0-9A-Za-z가-힣]{2,}", title.lower()))
+
+def title_similarity(a, b):
+    aa, bb = normalize_words(a), normalize_words(b)
+    return len(aa & bb) / len(aa | bb) if aa and bb else 0.0
+
+def is_similar_recent(conn, title):
+    rows = conn.execute(
+        "SELECT title FROM sent_articles WHERE datetime(sent_at) >= datetime('now','-18 hours') ORDER BY sent_at DESC LIMIT 250"
+    ).fetchall()
+    return any(title_similarity(title, r[0]) >= 0.58 for r in rows)
+
+def posts_last_24h(conn):
+    return conn.execute(
+        "SELECT COUNT(*) FROM sent_articles WHERE datetime(sent_at) >= datetime('now','-24 hours')"
+    ).fetchone()[0]
+
+def importance_score(item):
+    t=item["title"].lower()
+    keys=["속보","공식","확정","이적","영입","부상","선발","라인업","우승","신기록","계약",
+          "breaking","official","confirmed","transfer","trade","injury","lineup","champion","record","contract"]
+    return sum(3 for k in keys if k in t)
 
 def already_sent(conn, fp: str) -> bool:
     return conn.execute(
@@ -255,7 +280,7 @@ def collect_entries():
         if key not in unique or item["published_ts"] > unique[key]["published_ts"]:
             unique[key] = item
 
-    return sorted(unique.values(), key=lambda x: x["published_ts"], reverse=True)
+    return sorted(unique.values(), key=lambda x: (importance_score(x), x["published_ts"]), reverse=True)
 
 def seed_existing(conn):
     items = collect_entries()
@@ -288,13 +313,22 @@ def process_article(item):
 def run_cycle(conn):
     items = collect_entries()
     sent_count = 0
+    daily_count = posts_last_24h(conn)
+
+    if daily_count >= DAILY_POST_LIMIT:
+        log.info("Daily limit reached | %d/%d", daily_count, DAILY_POST_LIMIT)
+        return
 
     for item in items:
-        if sent_count >= MAX_POSTS_PER_CYCLE:
+        if sent_count >= MAX_POSTS_PER_CYCLE or daily_count + sent_count >= DAILY_POST_LIMIT:
             break
 
         fp = fingerprint(item["title"], item["link"])
         if already_sent(conn, fp):
+            continue
+        if is_similar_recent(conn, item["title"]):
+            mark_sent(conn, fp, item["title"], item["link"])
+            log.info("SIMILAR SKIP | %s", item["title"])
             continue
 
         try:
