@@ -40,6 +40,7 @@ RECENT_GAMES_LOOKBACK = int(os.getenv("RECENT_GAMES_LOOKBACK", "5"))
 MAX_PICKS_PER_GROUP = int(os.getenv("MAX_PICKS_PER_GROUP", "2"))
 
 ENABLE_RESULT_POSTS = os.getenv("ENABLE_RESULT_POSTS", "true").lower() == "true"
+POST_NEWS_PUBLICLY = os.getenv("POST_NEWS_PUBLICLY", "false").lower() == "true"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_PATH = os.getenv("DB_PATH", "sports_news.db")
@@ -759,12 +760,17 @@ def seed_existing(conn):
 def run_news_cycle(conn):
     items = collect_entries()
 
-    # 픽 분석용으로는 게시 한도와 무관하게 캐시
+    # 분석 재료로는 계속 수집/캐시
     for item in items:
         try:
             cache_article(conn, item)
         except Exception:
             log.exception("Article cache failed | %s", item["title"])
+
+    # v9: 채널에는 픽/결과만 게시. 뉴스는 내부 분석용.
+    if not POST_NEWS_PUBLICLY:
+        log.info("News cache updated | public posting disabled | candidates=%d", len(items))
+        return
 
     daily_count = posts_last_24h(conn)
     if daily_count >= DAILY_POST_LIMIT:
@@ -1243,7 +1249,7 @@ def select_prematch_top_picks(games, news_items):
         })
 
     prompt = f"""
-너는 SPORT NOW 경기 전 뉴스 분석 엔진이다.
+너는 SPORT NOW 프리매치 인텔리전스 엔진이다.
 
 분석 대상은 아래 메이저리그 예정 경기만 허용한다.
 제공된 최근 뉴스만 근거로 사용하고 외부 지식, 기억, 임의 통계, 배당은 사용하지 않는다.
@@ -1273,6 +1279,8 @@ def select_prematch_top_picks(games, news_items):
 - 종목/리그 인기도보다 실제 데이터 근거 강도를 우선한다.
 - pick_side는 반드시 "home" 또는 "away".
 - source_ids는 제공된 기사 ID만.
+- comment는 2~3문장으로, 왜 이 팀이 우세하다고 판단했는지 자연스럽게 설명한다.
+- 과장 표현, 확정적 표현, 결과 보장 표현은 금지.
 - JSON 배열만 출력.
 
 [
@@ -1282,6 +1290,7 @@ def select_prematch_top_picks(games, news_items):
     "probability":64,
     "confidence":"medium",
     "reasons":["근거1","근거2"],
+    "comment":"모델 코멘트 2~3문장",
     "source_ids":[1,5]
   }}
 ]
@@ -1388,16 +1397,18 @@ def format_prematch_pick(pick, news_items):
     conf = "높음" if pick["confidence"] == "high" else "보통"
 
     return (
-        f"🔥 <b>SPORT NOW BEST PICK</b>\n\n"
+        f"⚡ <b>SPORT NOW PRIME PICK</b>\n\n"
         f"🏆 {html.escape(g['league'])}\n"
         f"🏟 <b>{html.escape(g['away'])} vs {html.escape(g['home'])}</b>\n"
         f"⏰ 경기 시작: {start_kst.strftime('%m/%d %H:%M')} KST\n\n"
-        f"✅ 예상 승리팀: <b>{html.escape(pick['pick_team'])}</b>\n"
-        f"📊 데이터+뉴스 예상 우세도: <b>{pick['probability']}%</b>\n"
+        f"🎯 모델 선택: <b>{html.escape(pick['pick_team'])}</b>\n"
+        f"📈 PRIME CONFIDENCE: <b>{pick['probability']}%</b>\n"
         f"🔎 신뢰도: <b>{conf}</b>\n⏱ 경기 약 1시간 전 최종 분석\n\n"
         f"<b>분석 근거</b>\n{reasons}\n\n"
+        f"💬 <b>PRIME COMMENT</b>\n"
+        f"{html.escape(str(pick.get('comment') or '현재 확인 가능한 경기 전 정보 기준으로 우세한 흐름이 감지됩니다.'))}\n\n"
         f"<b>관련 기사</b>\n{sources}\n\n"
-        f"⚠️ 무료 경기 데이터와 뉴스 기반 AI 추정치이며 실제 배당모델의 확정 승률이나 결과 보장이 아닙니다."
+        f"⚠️ 경기 전 공개 데이터와 최신 팀 정보를 종합한 모델 추정치이며 결과를 보장하지 않습니다."
     )
 
 
@@ -1648,6 +1659,12 @@ def format_result_post(row, result, final_status, stats):
 
     icon = "✅ 적중" if final_status == "hit" else "❌ 미적중"
 
+    result_comment = (
+        "사전 분석에서 포착한 우세 흐름이 실제 결과로 이어졌습니다."
+        if final_status == "hit"
+        else "사전 우세 판단과 실제 결과가 엇갈렸습니다. 다음 분석에서는 해당 변수를 재점검합니다."
+    )
+
     today_total = stats["today_hit"] + stats["today_miss"]
     total_total = stats["total_hit"] + stats["total_miss"]
 
@@ -1661,18 +1678,19 @@ def format_result_post(row, result, final_status, stats):
     )
 
     return (
-        f"🏁 <b>SPORT NOW PICK RESULT</b>\n\n"
+        f"🏁 <b>SPORT NOW PRIME RESULT</b>\n\n"
         f"🏆 {html.escape(league)}\n"
         f"🏟 <b>{html.escape(away_team)} {result['away_score']} : "
         f"{result['home_score']} {html.escape(home_team)}</b>\n\n"
-        f"🎯 사전 PICK: <b>{html.escape(pick_team)}</b>\n"
-        f"📊 데이터+뉴스 예상 우세도: <b>{probability}%</b>\n"
+        f"🎯 PRIME PICK: <b>{html.escape(pick_team)}</b>\n"
+        f"📈 PRIME CONFIDENCE: <b>{probability}%</b>\n"
         f"📌 결과: <b>{icon}</b>\n\n"
+        f"💬 <b>RESULT COMMENT</b>\n{result_comment}\n\n"
         f"📈 최근 24시간: {stats['today_hit']}승 {stats['today_miss']}패 "
         f"({today_rate:.1f}%)\n"
         f"📚 누적: {stats['total_hit']}승 {stats['total_miss']}패 "
         f"({total_rate:.1f}%)\n\n"
-        f"⚠️ 뉴스 기반 AI 분석 기록이며 결과를 보장하지 않습니다."
+        f"⚠️ 프리매치 모델 기록이며 결과를 보장하지 않습니다."
     )
 
 
@@ -1757,7 +1775,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v8.2 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v9 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),

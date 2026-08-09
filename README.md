@@ -1,23 +1,34 @@
-# SportNow v8.2 — 국내/일본 일정 400 오류 수정
+# SPORT NOW v9 — Picks Only + Prime Comment
 
-핵심 수정:
-- 존재하지 않는 ESPN KBO/NPB/KBL/K League 코드를 더 이상 호출하지 않음
-- 따라서 HTTP 400 반복 로그 제거
-- KBO: KBO 공식 영문 Daily Schedule 우선 사용
-- NPB: NPB.jp 공식 월간 상세 일정 사용
-- K League 1: K리그 공식 일정 페이지 우선 파싱
-- MLB / NBA / 유럽 인기 축구리그: 기존 ESPN 공개 scoreboard 유지
-- KBL: 8월 현재 비시즌이라 잘못된 ESPN 요청을 하지 않음
+채널에는 아래만 공개합니다.
+- PRIME PICK
+- PRIME COMMENT
+- PRIME RESULT
+- RESULT COMMENT
+- 누적 적중률
 
-픽:
-- 경기 45~70분 전
-- 최소 우세도 55%
-- KBO+NPB는 asia_baseball 그룹으로 함께 비교
-- MLB 별도
-- 축구 인기리그 그룹
-- NBA 농구 그룹
-- 기준 미달이면 픽 없음
+뉴스는 채널에 올리지 않고 내부에서 계속 수집해 분석 재료로만 사용합니다.
 
-주의:
-- KBO/NPB/K리그 공식 사이트 HTML 구조가 바뀌면 해당 파서도 조정이 필요할 수 있음.
-- KBO/NPB/K리그 결과 자동판정은 현재 해외 ESPN 리그와 달리 별도 결과 파서가 아직 없어 pending으로 남길 수 있음.
+## PICK 게시 형식
+- 모델 선택
+- PRIME CONFIDENCE
+- 분석 근거
+- PRIME COMMENT 2~3문장
+- 관련 기사
+- 경기 시작시간
+
+## RESULT 게시 형식
+- 최종 스코어
+- PRIME PICK
+- 적중/미적중
+- RESULT COMMENT
+- 최근 24시간 적중률
+- 누적 적중률
+
+## Railway
+POST_NEWS_PUBLICLY=false
+PREMATCH_MIN_MINUTES=45
+PREMATCH_MAX_MINUTES=70
+MIN_NEWS_EDGE=55
+ENABLE_NEWS_PICKS=true
+ENABLE_RESULT_POSTS=true
