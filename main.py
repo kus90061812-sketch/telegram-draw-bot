@@ -30,12 +30,13 @@ SUMMARIZE_KOREAN = os.getenv("SUMMARIZE_KOREAN", "true").lower() == "true"
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 ENABLE_NEWS_PICKS = os.getenv("ENABLE_NEWS_PICKS", "true").lower() == "true"
-PREMATCH_MIN_MINUTES = int(os.getenv("PREMATCH_MIN_MINUTES", "90"))
-PREMATCH_MAX_MINUTES = int(os.getenv("PREMATCH_MAX_MINUTES", "240"))
-MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "4"))
-MIN_NEWS_EDGE = int(os.getenv("MIN_NEWS_EDGE", "58"))
+PREMATCH_MIN_MINUTES = int(os.getenv("PREMATCH_MIN_MINUTES", "45"))
+PREMATCH_MAX_MINUTES = int(os.getenv("PREMATCH_MAX_MINUTES", "70"))
+MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "8"))
+MIN_NEWS_EDGE = int(os.getenv("MIN_NEWS_EDGE", "55"))
 ENABLE_FREE_TEAM_DATA = os.getenv("ENABLE_FREE_TEAM_DATA", "true").lower() == "true"
 RECENT_GAMES_LOOKBACK = int(os.getenv("RECENT_GAMES_LOOKBACK", "5"))
+MAX_PICKS_PER_GROUP = int(os.getenv("MAX_PICKS_PER_GROUP", "2"))
 
 ENABLE_RESULT_POSTS = os.getenv("ENABLE_RESULT_POSTS", "true").lower() == "true"
 
@@ -405,7 +406,7 @@ def espn_scoreboard_url(sport, league):
     return f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
 
 def league_code_from_name(name):
-    for sport, league, league_name in MAJOR_LEAGUES:
+    for sport, league, league_name, pick_group in MAJOR_LEAGUES:
         if league_name == name:
             return sport, league
     return None, None
@@ -797,16 +798,23 @@ def run_news_cycle(conn):
 # MAJOR LEAGUE SCHEDULE
 # =========================
 MAJOR_LEAGUES = [
-    ("soccer", "eng.1", "EPL"),
-    ("soccer", "esp.1", "La Liga"),
-    ("soccer", "ger.1", "Bundesliga"),
-    ("soccer", "ita.1", "Serie A"),
-    ("soccer", "fra.1", "Ligue 1"),
-    ("soccer", "uefa.champions", "UEFA Champions League"),
-    ("baseball", "mlb", "MLB"),
-    ("basketball", "nba", "NBA"),
-    ("football", "nfl", "NFL"),
-    ("hockey", "nhl", "NHL"),
+    # 야구: KBO + NPB는 같은 그룹, MLB 별도
+    ("baseball", "kbo", "KBO", "asia_baseball"),
+    ("baseball", "npb", "NPB", "asia_baseball"),
+    ("baseball", "mlb", "MLB", "mlb"),
+
+    # 축구: 인기 리그만
+    ("soccer", "kor.1", "K League 1", "soccer"),
+    ("soccer", "eng.1", "EPL", "soccer"),
+    ("soccer", "esp.1", "La Liga", "soccer"),
+    ("soccer", "ger.1", "Bundesliga", "soccer"),
+    ("soccer", "ita.1", "Serie A", "soccer"),
+    ("soccer", "fra.1", "Ligue 1", "soccer"),
+    ("soccer", "uefa.champions", "UEFA Champions League", "soccer"),
+
+    # 농구: 인기 리그만
+    ("basketball", "kbl", "KBL", "basketball"),
+    ("basketball", "nba", "NBA", "basketball"),
 ]
 
 
@@ -818,13 +826,15 @@ def fetch_major_upcoming_games():
         for d in (-1, 0, 1, 2)
     }
 
-    for sport, league, league_name in MAJOR_LEAGUES:
+    for sport, league, league_name, pick_group in MAJOR_LEAGUES:
         for date_key in date_keys:
             url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
 
             try:
                 r = requests.get(url, params={"dates": date_key}, timeout=15)
                 if r.status_code != 200:
+                    if league_name in ("KBO", "NPB", "KBL", "K League 1"):
+                        log.info("Schedule source unavailable | %s | HTTP %s", league_name, r.status_code)
                     continue
 
                 data = r.json()
@@ -872,6 +882,7 @@ def fetch_major_upcoming_games():
                         "event_id": str(ev.get("id", "")),
                         "sport": sport,
                         "league": league_name,
+                        "pick_group": pick_group,
                         "home": home["name"],
                         "away": away["name"],
                         "start_utc": start.isoformat(),
@@ -961,14 +972,20 @@ def select_prematch_top_picks(games, news_items):
 
 규칙:
 - 근거 없는 경기는 제외.
-- 최대 4경기.
-- 가장 근거가 강하고 한쪽 우세가 뚜렷한 순서.
-- 억지로 4개를 채우지 않는다.
+- 절대 개수를 채우려고 하지 않는다.
+- 각 pick_group별로 가장 강한 경기만 고른다.
+- asia_baseball(KBO+NPB), mlb, soccer, basketball 각각 최대 2개 이하.
+- 같은 그룹 안에서 비슷하면 더 강한 1개만 선택한다.
+- 가장 근거가 강하고 한쪽 우세가 뚜렷한 경기만 출력한다.
+- 애매하면 빈 배열 []을 출력해도 된다.
 - probability는 실제 통계 승률이 아니라 '무료 경기 데이터 + 뉴스 기반 AI 추정 우세도'.
 - base_home_edge는 최근 경기 성적/득실만으로 계산한 홈팀 기준점이다.
 - base_home_edge를 무시하지 말되, 부상/결장/라인업 뉴스가 강하면 조정할 수 있다.
 - probability는 {MIN_NEWS_EDGE}~75 정수.
 - confidence는 high 또는 medium.
+- probability가 55 미만인 경기는 절대 출력하지 않는다.
+- high 신뢰도를 우선하고, medium은 근거가 충분할 때만 허용한다.
+- 종목/리그 인기도보다 실제 데이터 근거 강도를 우선한다.
 - pick_side는 반드시 "home" 또는 "away".
 - source_ids는 제공된 기사 ID만.
 - JSON 배열만 출력.
@@ -1028,15 +1045,34 @@ def select_prematch_top_picks(games, news_items):
 
         g = game_map[eid]
         x["_game"] = g
+        x["pick_group"] = g.get("pick_group", "other")
         x["pick_team"] = g[side]
         x["probability"] = prob
         result.append(x)
 
     result.sort(
-        key=lambda x: (x["probability"], x["confidence"] == "high"),
+        key=lambda x: (x["confidence"] == "high", x["probability"]),
         reverse=True,
     )
-    return result[:4]
+
+    # 그룹별 품질 우선: 억지로 채우지 않고 각 그룹 상위만.
+    grouped = {}
+    for item in result:
+        grp = item.get("pick_group", "other")
+        grouped.setdefault(grp, [])
+        if len(grouped[grp]) < MAX_PICKS_PER_GROUP:
+            grouped[grp].append(item)
+
+    final = []
+    # 아시아 야구는 KBO+NPB를 한 묶음으로 먼저 비교
+    for grp in ("asia_baseball", "mlb", "soccer", "basketball"):
+        final.extend(grouped.get(grp, []))
+
+    final.sort(
+        key=lambda x: (x["confidence"] == "high", x["probability"]),
+        reverse=True,
+    )
+    return final
 
 
 def format_prematch_pick(pick, news_items):
@@ -1067,18 +1103,41 @@ def format_prematch_pick(pick, news_items):
     conf = "높음" if pick["confidence"] == "high" else "보통"
 
     return (
-        f"🎯 <b>SPORT NOW 프리매치 PICK</b>\n\n"
+        f"🔥 <b>SPORT NOW BEST PICK</b>\n\n"
         f"🏆 {html.escape(g['league'])}\n"
         f"🏟 <b>{html.escape(g['away'])} vs {html.escape(g['home'])}</b>\n"
         f"⏰ 경기 시작: {start_kst.strftime('%m/%d %H:%M')} KST\n\n"
         f"✅ 예상 승리팀: <b>{html.escape(pick['pick_team'])}</b>\n"
         f"📊 데이터+뉴스 예상 우세도: <b>{pick['probability']}%</b>\n"
-        f"🔎 신뢰도: <b>{conf}</b>\n\n"
+        f"🔎 신뢰도: <b>{conf}</b>\n⏱ 경기 약 1시간 전 최종 분석\n\n"
         f"<b>분석 근거</b>\n{reasons}\n\n"
         f"<b>관련 기사</b>\n{sources}\n\n"
         f"⚠️ 무료 경기 데이터와 뉴스 기반 AI 추정치이며 실제 배당모델의 확정 승률이나 결과 보장이 아닙니다."
     )
 
+
+
+def group_pick_counts_last_24h(conn):
+    cutoff = hours_ago_iso(24)
+    rows = conn.execute(
+        """SELECT league FROM prematch_picks
+           WHERE posted_at >= ?""",
+        (cutoff,),
+    ).fetchall()
+
+    counts = {"asia_baseball": 0, "mlb": 0, "soccer": 0, "basketball": 0}
+
+    for (league,) in rows:
+        if league in ("KBO", "NPB"):
+            counts["asia_baseball"] += 1
+        elif league == "MLB":
+            counts["mlb"] += 1
+        elif league in ("KBL", "NBA"):
+            counts["basketball"] += 1
+        else:
+            counts["soccer"] += 1
+
+    return counts
 
 def maybe_post_prematch_picks(conn):
     if not ENABLE_NEWS_PICKS:
@@ -1111,8 +1170,18 @@ def maybe_post_prematch_picks(conn):
 
     remaining = MAX_PICKS_PER_DAY - used
 
-    for pick in picks[:remaining]:
+    group_counts = group_pick_counts_last_24h(conn)
+
+    for pick in picks:
+        if remaining <= 0:
+            break
+
         g = pick["_game"]
+        grp = g.get("pick_group", "other")
+
+        if grp in group_counts and group_counts[grp] >= MAX_PICKS_PER_GROUP:
+            continue
+
         event_id = str(g["event_id"])
 
         try:
@@ -1153,6 +1222,10 @@ def maybe_post_prematch_picks(conn):
                 )
 
             conn.commit()
+            remaining -= 1
+            if grp in group_counts:
+                group_counts[grp] += 1
+
             log.info(
                 "PREMATCH PICK POSTED | %s vs %s | pick=%s | %s%%",
                 g["away"], g["home"], pick["pick_team"], pick["probability"]
@@ -1394,7 +1467,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v7 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v8 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
