@@ -51,6 +51,12 @@ LINEUP_MIN_PLAYERS = int(os.getenv("LINEUP_MIN_PLAYERS", "7"))
 ENABLE_ASIA_LINEUP_FALLBACK = os.getenv("ENABLE_ASIA_LINEUP_FALLBACK", "true").lower() == "true"
 KBO_NAVER_GATEWAY = os.getenv("KBO_NAVER_GATEWAY", "https://api-gw.sports.naver.com")
 KBO_NAVER_MOBILE = os.getenv("KBO_NAVER_MOBILE", "https://m.sports.naver.com/kbaseball")
+SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY", "").strip()
+SPORTRADAR_ACCESS_LEVEL = os.getenv("SPORTRADAR_ACCESS_LEVEL", "trial").strip()
+SPORTRADAR_LANGUAGE = os.getenv("SPORTRADAR_LANGUAGE", "en").strip()
+SPORTRADAR_BASE_URL = os.getenv("SPORTRADAR_BASE_URL", "https://api.sportradar.com").rstrip("/")
+ENABLE_SPORTRADAR_KBO = os.getenv("ENABLE_SPORTRADAR_KBO", "true").lower() == "true"
+
 NPB_YAHOO_BASE = os.getenv("NPB_YAHOO_BASE", "https://baseball.yahoo.co.jp")
 
 ENABLE_COMBO_PICKS = os.getenv("ENABLE_COMBO_PICKS", "true").lower() == "true"
@@ -1369,6 +1375,269 @@ def _find_lineup_lists(obj, path=""):
     return found
 
 
+
+KBO_SR_ALIASES = {
+    "LG": ["lg", "lg twins", "twins"],
+    "HANWHA": ["hanwha", "hanwha eagles", "eagles"],
+    "SSG": ["ssg", "ssg landers", "landers"],
+    "SAMSUNG": ["samsung", "samsung lions", "lions"],
+    "NC": ["nc", "nc dinos", "dinos"],
+    "KT": ["kt", "kt wiz", "wiz"],
+    "LOTTE": ["lotte", "lotte giants", "giants"],
+    "KIA": ["kia", "kia tigers", "tigers"],
+    "DOOSAN": ["doosan", "doosan bears", "bears"],
+    "KIWOOM": ["kiwoom", "kiwoom heroes", "heroes"],
+}
+
+def _norm_sr_team(value):
+    return re.sub(r"[^a-z0-9가-힣]", "", str(value or "").lower())
+
+def _sportradar_headers():
+    return {
+        "accept": "application/json",
+        "x-api-key": SPORTRADAR_API_KEY,
+        "User-Agent": "SportNow/12",
+    }
+
+def _sr_team_matches(kbo_code, competitor):
+    aliases = KBO_SR_ALIASES.get(str(kbo_code or "").upper(), [str(kbo_code or "").lower()])
+    fields = []
+    if isinstance(competitor, dict):
+        for k in ("name", "abbreviation", "short_name"):
+            if competitor.get(k):
+                fields.append(str(competitor.get(k)))
+    blob = " ".join(fields).lower()
+    compact = _norm_sr_team(blob)
+
+    for alias in aliases:
+        a = alias.lower()
+        if a in blob or _norm_sr_team(a) in compact:
+            return True
+    return False
+
+def _iter_sr_summaries(data):
+    """Daily Summaries의 구조가 조금 달라도 sport_event 포함 객체를 찾음."""
+    found = []
+    def walk(obj):
+        if isinstance(obj, dict):
+            if isinstance(obj.get("sport_event"), dict):
+                found.append(obj)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+    walk(data)
+
+    # event id 기준 중복 제거
+    uniq = {}
+    for x in found:
+        eid = (x.get("sport_event") or {}).get("id")
+        if eid:
+            uniq[eid] = x
+    return list(uniq.values())
+
+def _sr_event_is_kbo(summary):
+    ctx = summary.get("sport_event_context") or {}
+    if not ctx and isinstance(summary.get("sport_event"), dict):
+        ctx = summary["sport_event"].get("sport_event_context") or {}
+
+    comp = ctx.get("competition") or {}
+    cat = ctx.get("category") or {}
+    text = " ".join([
+        str(comp.get("name", "")),
+        str(comp.get("id", "")),
+        str(cat.get("name", "")),
+        str(cat.get("country_code", "")),
+    ]).lower()
+
+    # competition 이름에 KBO가 가장 신뢰도 높은 기준.
+    return ("kbo" in text) or ("korea baseball" in text)
+
+def _sr_event_competitors(summary):
+    ev = summary.get("sport_event") or {}
+    comps = ev.get("competitors") or summary.get("competitors") or []
+    if isinstance(comps, dict):
+        comps = comps.get("competitor") or comps.get("competitors") or []
+    return comps if isinstance(comps, list) else []
+
+def fetch_sportradar_kbo_event_id(game):
+    """Global Baseball Daily Summaries에서 현재 KBO 경기의 sport_event_id를 찾음."""
+    if not ENABLE_SPORTRADAR_KBO or not SPORTRADAR_API_KEY:
+        return None
+
+    try:
+        start_kst = datetime.fromisoformat(game["start_utc"]).astimezone(timezone(timedelta(hours=9)))
+        date_str = start_kst.strftime("%Y-%m-%d")
+
+        url = (
+            f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
+            f"{SPORTRADAR_LANGUAGE}/schedules/{date_str}/summaries.json"
+        )
+        r = requests.get(url, headers=_sportradar_headers(), timeout=20)
+
+        if r.status_code != 200:
+            log.warning("Sportradar Daily Summaries failed | HTTP %s | %s", r.status_code, r.text[:180])
+            return None
+
+        summaries = _iter_sr_summaries(r.json())
+        best = None
+
+        for summary in summaries:
+            if not _sr_event_is_kbo(summary):
+                continue
+
+            comps = _sr_event_competitors(summary)
+            if len(comps) < 2:
+                continue
+
+            home_comp = next((c for c in comps if c.get("qualifier") == "home"), None)
+            away_comp = next((c for c in comps if c.get("qualifier") == "away"), None)
+
+            if not home_comp or not away_comp:
+                continue
+
+            if _sr_team_matches(game.get("home"), home_comp) and _sr_team_matches(game.get("away"), away_comp):
+                ev = summary.get("sport_event") or {}
+                best = ev.get("id")
+                if best:
+                    game["sportradar_home_name"] = home_comp.get("name", "")
+                    game["sportradar_away_name"] = away_comp.get("name", "")
+                    break
+
+        if best:
+            log.info(
+                "Sportradar KBO event matched | %s vs %s | %s",
+                game.get("away"), game.get("home"), best
+            )
+        else:
+            log.info(
+                "Sportradar KBO event not matched | %s vs %s",
+                game.get("away"), game.get("home")
+            )
+
+        return best
+
+    except Exception:
+        log.exception("Sportradar KBO event lookup failed")
+        return None
+
+def _sr_lineup_competitors(data):
+    """Sport Event Lineups의 competitors 배열을 구조 변화에 강하게 찾음."""
+    results = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            if (
+                obj.get("qualifier") in ("home", "away")
+                and isinstance(obj.get("players"), list)
+            ):
+                results.append(obj)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    walk(data)
+
+    uniq = {}
+    for c in results:
+        key = c.get("id") or f'{c.get("qualifier")}:{c.get("name")}'
+        uniq[key] = c
+    return list(uniq.values())
+
+def _sr_starters(competitor):
+    players = competitor.get("players") or []
+    starters = []
+
+    for pl in players:
+        if not isinstance(pl, dict) or pl.get("starter") is not True:
+            continue
+
+        starters.append({
+            "name": str(pl.get("name") or "").strip(),
+            "order": pl.get("order"),
+            "type": pl.get("type"),
+            "id": pl.get("id"),
+        })
+
+    # 타순 1~9 우선, 선발투수(order 없음)는 뒤.
+    starters.sort(
+        key=lambda x: (
+            99 if x.get("order") is None else int(x.get("order")),
+            x.get("name") or ""
+        )
+    )
+    return starters
+
+def fetch_sportradar_kbo_lineup(game):
+    """공식 Sport Event Lineups에서 starter=true 선수만 가져옴."""
+    if not ENABLE_SPORTRADAR_KBO or not SPORTRADAR_API_KEY:
+        return {"home": [], "away": [], "source": ""}
+
+    event_id = game.get("sportradar_event_id") or fetch_sportradar_kbo_event_id(game)
+    if not event_id:
+        return {"home": [], "away": [], "source": ""}
+
+    game["sportradar_event_id"] = event_id
+
+    try:
+        url = (
+            f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
+            f"{SPORTRADAR_LANGUAGE}/sport_events/{event_id}/lineups.json"
+        )
+        r = requests.get(url, headers=_sportradar_headers(), timeout=20)
+
+        # 라인업 발표 전에는 200이어도 starter가 없을 수 있으므로 가짜 확정 금지.
+        if r.status_code != 200:
+            log.info(
+                "Sportradar Lineups unavailable | %s | HTTP %s",
+                event_id, r.status_code
+            )
+            return {"home": [], "away": [], "source": ""}
+
+        competitors = _sr_lineup_competitors(r.json())
+        home_comp = next((c for c in competitors if c.get("qualifier") == "home"), None)
+        away_comp = next((c for c in competitors if c.get("qualifier") == "away"), None)
+
+        if not home_comp or not away_comp:
+            log.info("Sportradar Lineups missing competitors | %s", event_id)
+            return {"home": [], "away": [], "source": ""}
+
+        home_starters = _sr_starters(home_comp)
+        away_starters = _sr_starters(away_comp)
+
+        # 야구는 선발투수 포함 10명일 수도 있으므로,
+        # detect_confirmed_lineup은 기존 최소 7명 기준을 그대로 사용.
+        home_names = [x["name"] for x in home_starters if x.get("name")]
+        away_names = [x["name"] for x in away_starters if x.get("name")]
+
+        game["home_lineup_detail"] = home_starters
+        game["away_lineup_detail"] = away_starters
+
+        if len(home_names) >= LINEUP_MIN_PLAYERS and len(away_names) >= LINEUP_MIN_PLAYERS:
+            log.info(
+                "Sportradar KBO lineup confirmed | %s vs %s | home=%d away=%d",
+                game.get("away"), game.get("home"), len(home_names), len(away_names)
+            )
+            return {
+                "home": home_names,
+                "away": away_names,
+                "source": "Sportradar",
+            }
+
+        log.info(
+            "Sportradar lineup not posted yet | %s vs %s | home=%d away=%d",
+            game.get("away"), game.get("home"), len(home_names), len(away_names)
+        )
+        return {"home": [], "away": [], "source": ""}
+
+    except Exception:
+        log.exception("Sportradar KBO lineup fetch failed")
+        return {"home": [], "away": [], "source": ""}
+
+
 def _team_aliases_kbo(name):
     m={
         "LG":["LG","LG 트윈스"],"HANWHA":["HANWHA","한화","한화 이글스"],
@@ -1570,9 +1839,17 @@ def fetch_npb_yahoo_lineup(game):
 
 def enrich_asia_lineup(game):
     if game.get("league") == "KBO":
-        info = fetch_kbo_naver_mobile_lineup(game)
+        # 1순위: Sportradar Global Baseball v2 (공식 유료/Trial 데이터)
+        info = fetch_sportradar_kbo_lineup(game)
+
+        # 2순위: 네이버 모바일
+        if not info.get("home") or not info.get("away"):
+            info = fetch_kbo_naver_mobile_lineup(game)
+
+        # 3순위: 기존 네이버 gateway
         if not info.get("home") or not info.get("away"):
             info = fetch_kbo_naver_lineup(game)
+
     elif game.get("league") == "NPB":
         info = fetch_npb_yahoo_lineup(game)
     else:
@@ -2419,7 +2696,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v11.6 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v12 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
