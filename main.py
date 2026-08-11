@@ -33,11 +33,15 @@ AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 ENABLE_NEWS_PICKS = os.getenv("ENABLE_NEWS_PICKS", "true").lower() == "true"
 PREMATCH_MIN_MINUTES = int(os.getenv("PREMATCH_MIN_MINUTES", "45"))
 PREMATCH_MAX_MINUTES = int(os.getenv("PREMATCH_MAX_MINUTES", "70"))
-MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "8"))
+MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "16"))
 MIN_NEWS_EDGE = int(os.getenv("MIN_NEWS_EDGE", "55"))
 ENABLE_FREE_TEAM_DATA = os.getenv("ENABLE_FREE_TEAM_DATA", "true").lower() == "true"
 RECENT_GAMES_LOOKBACK = int(os.getenv("RECENT_GAMES_LOOKBACK", "5"))
-MAX_PICKS_PER_GROUP = int(os.getenv("MAX_PICKS_PER_GROUP", "2"))
+MAX_PICKS_PER_GROUP = int(os.getenv("MAX_PICKS_PER_GROUP", "4"))
+MAX_PICKS_MLB = int(os.getenv("MAX_PICKS_MLB", "4"))
+MAX_PICKS_ASIA_BASEBALL = int(os.getenv("MAX_PICKS_ASIA_BASEBALL", "4"))
+MAX_PICKS_SOCCER = int(os.getenv("MAX_PICKS_SOCCER", "4"))
+MAX_PICKS_BASKETBALL = int(os.getenv("MAX_PICKS_BASKETBALL", "4"))
 
 ENABLE_RESULT_POSTS = os.getenv("ENABLE_RESULT_POSTS", "true").lower() == "true"
 POST_NEWS_PUBLICLY = os.getenv("POST_NEWS_PUBLICLY", "false").lower() == "true"
@@ -2206,7 +2210,7 @@ def select_prematch_top_picks(games, news_items):
     for item in result:
         grp = item.get("pick_group", "other")
         grouped.setdefault(grp, [])
-        if len(grouped[grp]) < MAX_PICKS_PER_GROUP:
+        if len(grouped[grp]) < max_picks_for_group(grp):
             grouped[grp].append(item)
 
     final = []
@@ -2326,6 +2330,14 @@ def format_prematch_pick(pick, news_items):
     )
 
 
+
+def max_picks_for_group(grp):
+    return {
+        "mlb": MAX_PICKS_MLB,
+        "asia_baseball": MAX_PICKS_ASIA_BASEBALL,
+        "soccer": MAX_PICKS_SOCCER,
+        "basketball": MAX_PICKS_BASKETBALL,
+    }.get(grp, MAX_PICKS_PER_GROUP)
 
 def group_pick_counts_last_24h(conn):
     cutoff = hours_ago_iso(24)
@@ -2489,7 +2501,7 @@ def maybe_post_prematch_picks(conn):
         g = pick["_game"]
         grp = g.get("pick_group", "other")
 
-        if grp in group_counts and group_counts[grp] >= MAX_PICKS_PER_GROUP:
+        if grp in group_counts and group_counts[grp] >= max_picks_for_group(grp):
             continue
 
         event_id = str(g["event_id"])
@@ -2796,7 +2808,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.1 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
