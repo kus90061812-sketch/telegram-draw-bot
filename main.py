@@ -1389,6 +1389,55 @@ KBO_SR_ALIASES = {
     "KIWOOM": ["kiwoom", "kiwoom heroes", "heroes"],
 }
 
+NPB_SR_ALIASES = {
+    "巨人": ["yomiuri", "yomiuri giants", "giants"],
+    "DeNA": ["yokohama", "dena", "yokohama dena baystars", "baystars"],
+    "ヤクルト": ["yakult", "tokyo yakult swallows", "swallows"],
+    "阪神": ["hanshin", "hanshin tigers", "tigers"],
+    "広島": ["hiroshima", "hiroshima carp", "carp"],
+    "中日": ["chunichi", "chunichi dragons", "dragons"],
+    "日本ハム": ["nippon ham", "hokkaido nippon-ham fighters", "fighters"],
+    "ロッテ": ["lotte marines", "chiba lotte marines", "marines"],
+    "楽天": ["rakuten", "tohoku rakuten golden eagles", "golden eagles"],
+    "ソフトバンク": ["softbank", "fukuoka softbank hawks", "hawks"],
+    "西武": ["seibu", "saitama seibu lions", "lions"],
+    "オリックス": ["orix", "orix buffaloes", "buffaloes"],
+}
+
+MLB_SR_ALIASES = {
+    "Arizona Diamondbacks": ["arizona diamondbacks", "diamondbacks"],
+    "Atlanta Braves": ["atlanta braves", "braves"],
+    "Baltimore Orioles": ["baltimore orioles", "orioles"],
+    "Boston Red Sox": ["boston red sox", "red sox"],
+    "Chicago Cubs": ["chicago cubs", "cubs"],
+    "Chicago White Sox": ["chicago white sox", "white sox"],
+    "Cincinnati Reds": ["cincinnati reds", "reds"],
+    "Cleveland Guardians": ["cleveland guardians", "guardians"],
+    "Colorado Rockies": ["colorado rockies", "rockies"],
+    "Detroit Tigers": ["detroit tigers", "tigers"],
+    "Houston Astros": ["houston astros", "astros"],
+    "Kansas City Royals": ["kansas city royals", "royals"],
+    "Los Angeles Angels": ["los angeles angels", "angels"],
+    "Los Angeles Dodgers": ["los angeles dodgers", "dodgers"],
+    "Miami Marlins": ["miami marlins", "marlins"],
+    "Milwaukee Brewers": ["milwaukee brewers", "brewers"],
+    "Minnesota Twins": ["minnesota twins", "twins"],
+    "New York Mets": ["new york mets", "mets"],
+    "New York Yankees": ["new york yankees", "yankees"],
+    "Athletics": ["athletics", "oakland athletics"],
+    "Philadelphia Phillies": ["philadelphia phillies", "phillies"],
+    "Pittsburgh Pirates": ["pittsburgh pirates", "pirates"],
+    "San Diego Padres": ["san diego padres", "padres"],
+    "San Francisco Giants": ["san francisco giants", "giants"],
+    "Seattle Mariners": ["seattle mariners", "mariners"],
+    "St. Louis Cardinals": ["st louis cardinals", "st. louis cardinals", "cardinals"],
+    "Tampa Bay Rays": ["tampa bay rays", "rays"],
+    "Texas Rangers": ["texas rangers", "rangers"],
+    "Toronto Blue Jays": ["toronto blue jays", "blue jays"],
+    "Washington Nationals": ["washington nationals", "nationals"],
+}
+
+
 def _norm_sr_team(value):
     return re.sub(r"[^a-z0-9가-힣]", "", str(value or "").lower())
 
@@ -1399,8 +1448,14 @@ def _sportradar_headers():
         "User-Agent": "SportNow/12",
     }
 
-def _sr_team_matches(kbo_code, competitor):
-    aliases = KBO_SR_ALIASES.get(str(kbo_code or "").upper(), [str(kbo_code or "").lower()])
+def _sr_team_matches(team_name, competitor, league=None):
+    if league == "KBO":
+        aliases = KBO_SR_ALIASES.get(str(team_name or "").upper(), [str(team_name or "").lower()])
+    elif league == "NPB":
+        aliases = NPB_SR_ALIASES.get(str(team_name or ""), [str(team_name or "").lower()])
+    else:
+        aliases = MLB_SR_ALIASES.get(str(team_name or ""), [str(team_name or "").lower()])
+
     fields = []
     if isinstance(competitor, dict):
         for k in ("name", "abbreviation", "short_name"):
@@ -1410,10 +1465,11 @@ def _sr_team_matches(kbo_code, competitor):
     compact = _norm_sr_team(blob)
 
     for alias in aliases:
-        a = alias.lower()
+        a = str(alias).lower()
         if a in blob or _norm_sr_team(a) in compact:
             return True
     return False
+
 
 def _iter_sr_summaries(data):
     """Daily Summaries의 구조가 조금 달라도 sport_event 포함 객체를 찾음."""
@@ -1461,90 +1517,130 @@ def _sr_event_competitors(summary):
         comps = comps.get("competitor") or comps.get("competitors") or []
     return comps if isinstance(comps, list) else []
 
-def fetch_sportradar_kbo_event_id(game):
-    """Global Baseball Daily Summaries에서 현재 KBO 경기의 sport_event_id를 찾음."""
-    if not ENABLE_SPORTRADAR_KBO or not SPORTRADAR_API_KEY:
+def fetch_sportradar_baseball_event_id(game):
+    """KBO/NPB/MLB 공통: 양 팀 + home/away + 경기시각으로 sport_event_id 매칭."""
+    if not SPORTRADAR_API_KEY:
+        return None
+
+    league = game.get("league")
+    if league not in ("KBO", "NPB", "MLB"):
         return None
 
     try:
-        start_kst = datetime.fromisoformat(game["start_utc"]).astimezone(timezone(timedelta(hours=9)))
-        date_str = start_kst.strftime("%Y-%m-%d")
+        target = datetime.fromisoformat(game["start_utc"])
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+
+        # 각 리그 현지 날짜 기준으로 Daily Summaries 호출
+        tz = timezone(timedelta(hours=9)) if league in ("KBO", "NPB") else timezone.utc
+        date_str = target.astimezone(tz).strftime("%Y-%m-%d")
 
         url = (
             f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
             f"{SPORTRADAR_LANGUAGE}/schedules/{date_str}/summaries.json"
         )
         r = requests.get(url, headers=_sportradar_headers(), timeout=20)
-
         if r.status_code != 200:
-            log.warning("Sportradar Daily Summaries failed | HTTP %s | %s", r.status_code, r.text[:180])
+            log.warning("Sportradar Daily Summaries failed | %s | HTTP %s | %s",
+                        league, r.status_code, r.text[:180])
             return None
 
-        summaries = _iter_sr_summaries(r.json())
-        best = None
-
-        for summary in summaries:
-            if not _sr_event_is_kbo(summary):
-                continue
-
+        candidates = []
+        for summary in _iter_sr_summaries(r.json()):
+            ev = summary.get("sport_event") or {}
             comps = _sr_event_competitors(summary)
             if len(comps) < 2:
                 continue
 
-            home_comp = next((c for c in comps if c.get("qualifier") == "home"), None)
-            away_comp = next((c for c in comps if c.get("qualifier") == "away"), None)
-
-            if not home_comp or not away_comp:
+            hm = [c for c in comps if _sr_team_matches(game.get("home"), c, league)]
+            aw = [c for c in comps if _sr_team_matches(game.get("away"), c, league)]
+            if not hm or not aw:
                 continue
 
-            if _sr_team_matches(game.get("home"), home_comp) and _sr_team_matches(game.get("away"), away_comp):
-                ev = summary.get("sport_event") or {}
-                best = ev.get("id")
-                if best:
-                    game["sportradar_home_name"] = home_comp.get("name", "")
-                    game["sportradar_away_name"] = away_comp.get("name", "")
-                    break
+            for hc in hm:
+                for ac in aw:
+                    if hc.get("id") and hc.get("id") == ac.get("id"):
+                        continue
 
-        if best:
-            log.info(
-                "Sportradar KBO event matched | %s vs %s | %s",
-                game.get("away"), game.get("home"), best
-            )
-        else:
-            log.info(
-                "Sportradar KBO event not matched | %s vs %s",
-                game.get("away"), game.get("home")
-            )
+                    score = 100
+                    if hc.get("qualifier") == "home":
+                        score += 25
+                    if ac.get("qualifier") == "away":
+                        score += 25
 
-        return best
+                    diff = 9999
+                    try:
+                        sd = datetime.fromisoformat(str(ev.get("start_time", "")).replace("Z", "+00:00"))
+                        diff = abs((sd - target).total_seconds()) / 60
+                        if diff <= 5:
+                            score += 50
+                        elif diff <= 30:
+                            score += 25
+                        elif diff <= 120:
+                            score += 5
+                    except Exception:
+                        pass
+
+                    ctx = summary.get("sport_event_context") or ev.get("sport_event_context") or {}
+                    txt = str(ctx).lower()
+                    if league.lower() in txt:
+                        score += 20
+                    if league == "KBO" and ("korea" in txt or "'kor'" in txt):
+                        score += 10
+                    if league == "NPB" and ("japan" in txt or "'jpn'" in txt):
+                        score += 10
+                    if league == "MLB" and ("mlb" in txt or "major league" in txt):
+                        score += 10
+
+                    candidates.append((score, diff, ev.get("id"), hc, ac))
+
+        if not candidates:
+            log.info("Sportradar %s event not matched | %s vs %s",
+                     league, game.get("away"), game.get("home"))
+            return None
+
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        score, diff, eid, hc, ac = candidates[0]
+        if not eid:
+            return None
+
+        game["sportradar_home_id"] = hc.get("id", "")
+        game["sportradar_away_id"] = ac.get("id", "")
+        game["sportradar_home_name"] = hc.get("name", "")
+        game["sportradar_away_name"] = ac.get("name", "")
+
+        log.info(
+            "Sportradar %s event matched | %s vs %s | %s | SR=%s vs %s | diff=%.1fm",
+            league, game.get("away"), game.get("home"), eid,
+            ac.get("name", ""), hc.get("name", ""), diff
+        )
+        return eid
 
     except Exception:
-        log.exception("Sportradar KBO event lookup failed")
+        log.exception("Sportradar %s event lookup failed", league)
         return None
 
+
 def _sr_lineup_competitors(data):
-    """Sport Event Lineups의 competitors 배열을 구조 변화에 강하게 찾음."""
-    results = []
-
+    """Global Baseball lineups의 direct/nested competitor 구조를 모두 처리."""
+    results=[]
     def walk(obj):
-        if isinstance(obj, dict):
-            if (
-                obj.get("qualifier") in ("home", "away")
-                and isinstance(obj.get("players"), list)
-            ):
+        if isinstance(obj,dict):
+            if obj.get("qualifier") in ("home","away") and isinstance(obj.get("players"),list):
                 results.append(obj)
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v)
-
+            comp=obj.get("competitor")
+            if isinstance(comp,dict) and isinstance(obj.get("players"),list):
+                merged=dict(comp); merged["players"]=obj["players"]
+                if merged.get("qualifier") in ("home","away"): results.append(merged)
+            for v in obj.values(): walk(v)
+        elif isinstance(obj,list):
+            for v in obj: walk(v)
     walk(data)
-
-    uniq = {}
+    uniq={}
     for c in results:
-        key = c.get("id") or f'{c.get("qualifier")}:{c.get("name")}'
-        uniq[key] = c
+        key=c.get("id") or f'{c.get("qualifier")}:{c.get("name")}'
+        if key not in uniq or len(c.get("players") or [])>len(uniq[key].get("players") or []):
+            uniq[key]=c
     return list(uniq.values())
 
 def _sr_starters(competitor):
@@ -1571,12 +1667,13 @@ def _sr_starters(competitor):
     )
     return starters
 
-def fetch_sportradar_kbo_lineup(game):
-    """공식 Sport Event Lineups에서 starter=true 선수만 가져옴."""
-    if not ENABLE_SPORTRADAR_KBO or not SPORTRADAR_API_KEY:
+def fetch_sportradar_baseball_lineup(game):
+    """KBO/NPB/MLB 공통 Sport Event Lineups."""
+    league = game.get("league")
+    if league not in ("KBO", "NPB", "MLB") or not SPORTRADAR_API_KEY:
         return {"home": [], "away": [], "source": ""}
 
-    event_id = game.get("sportradar_event_id") or fetch_sportradar_kbo_event_id(game)
+    event_id = game.get("sportradar_event_id") or fetch_sportradar_baseball_event_id(game)
     if not event_id:
         return {"home": [], "away": [], "source": ""}
 
@@ -1589,12 +1686,9 @@ def fetch_sportradar_kbo_lineup(game):
         )
         r = requests.get(url, headers=_sportradar_headers(), timeout=20)
 
-        # 라인업 발표 전에는 200이어도 starter가 없을 수 있으므로 가짜 확정 금지.
         if r.status_code != 200:
-            log.info(
-                "Sportradar Lineups unavailable | %s | HTTP %s",
-                event_id, r.status_code
-            )
+            log.info("Sportradar %s Lineups unavailable | %s | HTTP %s",
+                     league, event_id, r.status_code)
             return {"home": [], "away": [], "source": ""}
 
         competitors = _sr_lineup_competitors(r.json())
@@ -1602,14 +1696,12 @@ def fetch_sportradar_kbo_lineup(game):
         away_comp = next((c for c in competitors if c.get("qualifier") == "away"), None)
 
         if not home_comp or not away_comp:
-            log.info("Sportradar Lineups missing competitors | %s", event_id)
+            log.info("Sportradar %s Lineups missing competitors | %s", league, event_id)
             return {"home": [], "away": [], "source": ""}
 
         home_starters = _sr_starters(home_comp)
         away_starters = _sr_starters(away_comp)
 
-        # 야구는 선발투수 포함 10명일 수도 있으므로,
-        # detect_confirmed_lineup은 기존 최소 7명 기준을 그대로 사용.
         home_names = [x["name"] for x in home_starters if x.get("name")]
         away_names = [x["name"] for x in away_starters if x.get("name")]
 
@@ -1618,23 +1710,19 @@ def fetch_sportradar_kbo_lineup(game):
 
         if len(home_names) >= LINEUP_MIN_PLAYERS and len(away_names) >= LINEUP_MIN_PLAYERS:
             log.info(
-                "Sportradar KBO lineup confirmed | %s vs %s | home=%d away=%d",
-                game.get("away"), game.get("home"), len(home_names), len(away_names)
+                "Sportradar %s lineup confirmed | %s vs %s | home=%d away=%d",
+                league, game.get("away"), game.get("home"), len(home_names), len(away_names)
             )
-            return {
-                "home": home_names,
-                "away": away_names,
-                "source": "Sportradar",
-            }
+            return {"home": home_names, "away": away_names, "source": "Sportradar"}
 
         log.info(
-            "Sportradar lineup not posted yet | %s vs %s | home=%d away=%d",
-            game.get("away"), game.get("home"), len(home_names), len(away_names)
+            "Sportradar %s lineup not posted yet | %s vs %s | home=%d away=%d",
+            league, game.get("away"), game.get("home"), len(home_names), len(away_names)
         )
         return {"home": [], "away": [], "source": ""}
 
     except Exception:
-        log.exception("Sportradar KBO lineup fetch failed")
+        log.exception("Sportradar %s lineup fetch failed", league)
         return {"home": [], "away": [], "source": ""}
 
 
@@ -1838,20 +1926,32 @@ def fetch_npb_yahoo_lineup(game):
         return {"home": [], "away": [], "source": ""}
 
 def enrich_asia_lineup(game):
-    if game.get("league") == "KBO":
-        # 1순위: Sportradar Global Baseball v2 (공식 유료/Trial 데이터)
-        info = fetch_sportradar_kbo_lineup(game)
+    league = game.get("league")
 
-        # 2순위: 네이버 모바일
+    if league == "KBO":
+        # 1순위 Sportradar
+        info = fetch_sportradar_baseball_lineup(game)
+        # fallback 네이버
         if not info.get("home") or not info.get("away"):
             info = fetch_kbo_naver_mobile_lineup(game)
-
-        # 3순위: 기존 네이버 gateway
         if not info.get("home") or not info.get("away"):
             info = fetch_kbo_naver_lineup(game)
 
-    elif game.get("league") == "NPB":
-        info = fetch_npb_yahoo_lineup(game)
+    elif league == "NPB":
+        # 1순위 Sportradar
+        info = fetch_sportradar_baseball_lineup(game)
+        # fallback SportsNavi
+        if not info.get("home") or not info.get("away"):
+            info = fetch_npb_yahoo_lineup(game)
+
+    elif league == "MLB":
+        # 1순위 Sportradar
+        info = fetch_sportradar_baseball_lineup(game)
+        # MLB는 기존 ESPN competitor/summary 구조가 detect_confirmed_lineup에서 fallback 역할
+        # Sportradar 실패 시 별도 강제 덮어쓰기 없이 기존 데이터 사용
+        if not info.get("home") or not info.get("away"):
+            return game
+
     else:
         return game
 
@@ -1948,7 +2048,7 @@ def select_prematch_top_picks(games, news_items):
     if REQUIRE_CONFIRMED_LINEUP:
         kept=[]
         for g in games:
-            if g.get("league") in ("KBO", "NPB"):
+            if g.get("league") in ("KBO", "NPB", "MLB"):
                 g = enrich_asia_lineup(g)
 
             baseball = g.get("sport")=="baseball" or g.get("league") in ("KBO","NPB","MLB")
@@ -2696,7 +2796,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v12 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),

@@ -1,27 +1,27 @@
-# SPORT NOW v12 — Sportradar KBO Lineups
+# SPORT NOW v13 — Sportradar All Baseball
 
-KBO 라인업 우선순위:
-1. Sportradar Global Baseball v2
-   - Daily Summaries에서 sport_event_id 탐색
-   - Sport Event Lineups 호출
-   - starter=true 선수만 실제 선발로 인정
-2. 네이버 모바일 fallback
-3. 네이버 gateway fallback
+KBO / NPB / MLB 라인업 소스를 Sportradar 1순위로 통일.
 
-라인업이 아직 발표되지 않았거나 API 응답에 starter=true가 충분히 없으면
-LINEUP CONFIRMED로 처리하지 않습니다.
+공통 흐름:
+1. Daily Summaries에서 팀 alias + home/away + 경기 시작시각으로 sport_event_id 매칭
+2. Sport Event Lineups 호출
+3. starter=true 선수만 실제 선발로 인정
+4. 양 팀 최소 LINEUP_MIN_PLAYERS 이상이면 LINEUP CONFIRMED
 
-Railway Variables:
-SPORTRADAR_API_KEY=발급받은키
-SPORTRADAR_ACCESS_LEVEL=trial
-SPORTRADAR_LANGUAGE=en
-ENABLE_SPORTRADAR_KBO=true
+Fallback:
+- KBO: 네이버 모바일 → 네이버 gateway
+- NPB: SportsNavi
+- MLB: 기존 ESPN 데이터
 
-기존:
-- KBO/NPB/MLB 분석
+기존 기능 유지:
 - PRIME SCORE
 - FINAL COMBO
 - 한글 팀명
 - 오마카세 버튼
 - PostgreSQL 결과 기록
-모두 유지됩니다.
+
+Railway 변수는 기존 v12/v12.1과 동일:
+SPORTRADAR_API_KEY=...
+SPORTRADAR_ACCESS_LEVEL=trial
+SPORTRADAR_LANGUAGE=en
+ENABLE_SPORTRADAR_KBO=true
