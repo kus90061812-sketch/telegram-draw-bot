@@ -46,6 +46,17 @@ BASEBALL_OFFENSE_WEIGHT = float(os.getenv("BASEBALL_OFFENSE_WEIGHT", "0.25"))
 BASEBALL_BULLPEN_WEIGHT = float(os.getenv("BASEBALL_BULLPEN_WEIGHT", "0.20"))
 BASEBALL_FORM_WEIGHT = float(os.getenv("BASEBALL_FORM_WEIGHT", "0.15"))
 BASEBALL_LINEUP_WEIGHT = float(os.getenv("BASEBALL_LINEUP_WEIGHT", "0.10"))
+REQUIRE_CONFIRMED_LINEUP = os.getenv("REQUIRE_CONFIRMED_LINEUP", "true").lower() == "true"
+LINEUP_MIN_PLAYERS = int(os.getenv("LINEUP_MIN_PLAYERS", "7"))
+ENABLE_COMBO_PICKS = os.getenv("ENABLE_COMBO_PICKS", "true").lower() == "true"
+COMBO_MIN_SCORE = int(os.getenv("COMBO_MIN_SCORE", "55"))
+COMBO_MAX_PER_GROUP = int(os.getenv("COMBO_MAX_PER_GROUP", "2"))
+PROMO_URL = os.getenv("PROMO_URL", "https://om-1224.com/?code=usdt")
+PROMO_BUTTON_TEXT = os.getenv("PROMO_BUTTON_TEXT", "🎰 오마카세 바로가기")
+PROMO_CODE = os.getenv("PROMO_CODE", "USDT")
+
+
+
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -190,6 +201,16 @@ def db():
             winner_team TEXT,
             settled_at TEXT,
             result_posted INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS combo_pick_logs (
+            combo_key TEXT PRIMARY KEY,
+            pick_group TEXT NOT NULL,
+            combo_text TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -694,7 +715,7 @@ RSS 설명: {summary}
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(text):
+def send_telegram(text, promo_button=False):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHANNEL_ID,
@@ -702,6 +723,16 @@ def send_telegram(text):
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
+
+    if promo_button:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[
+                {
+                    "text": PROMO_BUTTON_TEXT,
+                    "url": PROMO_URL
+                }
+            ]]
+        }
 
     for _ in range(3):
         r = requests.post(url, json=payload, timeout=25)
@@ -1294,6 +1325,30 @@ def news_side_signals(game, news_items):
 
     return result
 
+
+def detect_confirmed_lineup(game):
+    """실제 응답에 양 팀 선발 명단이 있을 때만 확정으로 판단."""
+    def names(side):
+        found = list(game.get(f"{side}_lineup") or [])
+        comp = game.get(f"{side}_competitor") or {}
+        pools = []
+        if isinstance(comp, dict):
+            for key in ("roster","lineup","starters","athletes"):
+                v=comp.get(key)
+                if isinstance(v,list): pools += v
+                elif isinstance(v,dict):
+                    for sub in ("athletes","entries","players","items"):
+                        if isinstance(v.get(sub),list): pools += v[sub]
+        for x in pools:
+            if not isinstance(x,dict): continue
+            a=x.get("athlete") if isinstance(x.get("athlete"),dict) else x
+            n=a.get("displayName") or a.get("fullName") or a.get("shortName") or x.get("name")
+            if n: found.append(str(n))
+        return list(dict.fromkeys(found))
+    h,a=names("home"),names("away")
+    return {"confirmed":len(h)>=LINEUP_MIN_PLAYERS and len(a)>=LINEUP_MIN_PLAYERS,
+            "home_players":h,"away_players":a,"home_count":len(h),"away_count":len(a)}
+
 def baseball_model_score(game, news_items):
     """KBO/NPB/MLB 전용 상대 우세 모델.
     값은 승률이 아니라 0~100 PRIME SCORE."""
@@ -1352,6 +1407,24 @@ def baseball_model_score(game, news_items):
 
 
 def select_prematch_top_picks(games, news_items):
+    if REQUIRE_CONFIRMED_LINEUP:
+        kept=[]
+        for g in games:
+            baseball = g.get("sport")=="baseball" or g.get("league") in ("KBO","NPB","MLB")
+            if not baseball:
+                kept.append(g); continue
+            st=g.get("lineup_status") or detect_confirmed_lineup(g)
+            g["lineup_status"]=st
+            if st["confirmed"]:
+                kept.append(g)
+            else:
+                log.info("Waiting confirmed lineup | %s | %s vs %s | home=%d away=%d",
+                         g.get("league"),g.get("away"),g.get("home"),
+                         st["home_count"],st["away_count"])
+        games=kept
+    if not games:
+        log.info("No eligible games with confirmed lineup")
+        return []
     if not games or len(news_items) < 3:
         return []
 
@@ -1359,6 +1432,7 @@ def select_prematch_top_picks(games, news_items):
     for g in games:
         g["base_home_edge"] = basic_model_score(g)
         if g.get("sport") == "baseball" or g.get("league") in ("KBO", "NPB", "MLB"):
+            g["lineup_status"] = detect_confirmed_lineup(g)
             g["baseball_model"] = baseball_model_score(g, news_items)
 
     news = []
@@ -1396,6 +1470,8 @@ def select_prematch_top_picks(games, news_items):
 - probability는 실제 통계 승률이 아니라 '무료 경기 데이터 + 뉴스 기반 AI 추정 우세도'.
 - base_home_edge는 최근 경기 성적/득실만으로 계산한 홈팀 기준점이다.
 - 야구 경기에는 baseball_model이 제공된다.
+- lineup_status.confirmed=true인 야구 경기만 최종 분석한다.
+- 확인되지 않은 출전 명단은 임의로 추측하지 않는다.
 - KBO/NPB/MLB는 반드시 baseball_model을 우선 참고한다.
 - 야구 가중치는 선발 30%, 타선 25%, 불펜 20%, 최근 팀 흐름 15%, 라인업/결장/기타 10%다.
 - 선발투수 하나만으로 승부를 판단하지 않는다.
@@ -1585,7 +1661,11 @@ def format_prematch_pick(pick, news_items):
         f"🏆 {html.escape(g['league'])}\n"
         f"🏟 <b>{html.escape(ko_team(g['away']))} vs {html.escape(ko_team(g['home']))}</b>\n"
         f"⏰ 경기 시작: {start_kst.strftime('%m/%d %H:%M')} KST\n\n"
-        f"🎯 모델 선택: <b>{html.escape(ko_team(pick['pick_team']))}</b>\n"
+        + (
+            "✅ <b>LINEUP CONFIRMED</b>\n"
+            if (g.get("lineup_status") or {}).get("confirmed") else ""
+        )
+        + f"🎯 모델 선택: <b>{html.escape(ko_team(pick['pick_team']))}</b>\n"
         f"📈 PRIME SCORE: <b>{pick['probability']}%</b>\n"
         f"🔎 신뢰도: <b>{conf}</b>\n⏱ 경기 약 1시간 전 최종 분석\n\n"
         f"<b>분석 근거</b>\n{reasons}\n\n"
@@ -1598,7 +1678,8 @@ def format_prematch_pick(pick, news_items):
             else ""
         )
         + f"<b>관련 기사</b>\n{sources}\n\n"
-        f"⚠️ PRIME SCORE는 실제 승률이 아니라 경기 전 공개 데이터와 최신 팀 정보를 종합한 상대우세 지표이며 결과를 보장하지 않습니다."
+        f"⚠️ PRIME SCORE는 실제 승률이 아니라 경기 전 공개 데이터와 최신 팀 정보를 종합한 상대우세 지표이며 결과를 보장하지 않습니다.\n"
+        f"🔑 가입코드: <b>{html.escape(PROMO_CODE)}</b>"
     )
 
 
@@ -1624,6 +1705,105 @@ def group_pick_counts_last_24h(conn):
             counts["soccer"] += 1
 
     return counts
+
+
+def combo_recently_posted(conn, combo_key):
+    row = conn.execute(
+        "SELECT 1 FROM combo_pick_logs WHERE combo_key=? LIMIT 1",
+        (combo_key,)
+    ).fetchone()
+    return row is not None
+
+def build_combo_posts(picks):
+    """같은 그룹 내 고득점 픽을 2개씩 묶는다.
+    최대 COMBO_MAX_PER_GROUP개 조합."""
+    groups = {}
+    for p in picks:
+        g = p.get("_game") or {}
+        grp = g.get("pick_group", "other")
+        if int(p.get("probability", 0)) < COMBO_MIN_SCORE:
+            continue
+        groups.setdefault(grp, []).append(p)
+
+    combos = []
+    for grp, arr in groups.items():
+        arr.sort(
+            key=lambda x: (x.get("confidence") == "high", int(x.get("probability", 0))),
+            reverse=True
+        )
+
+        # 1+2, 3+4 식으로 2폴 구성
+        pair_no = 1
+        for i in range(0, len(arr) - 1, 2):
+            if pair_no > COMBO_MAX_PER_GROUP:
+                break
+            a, b = arr[i], arr[i+1]
+            ga, gb = a["_game"], b["_game"]
+
+            combo_key = f"{grp}:{ga['event_id']}+{gb['event_id']}"
+            combos.append({
+                "combo_key": combo_key,
+                "pick_group": grp,
+                "pair_no": pair_no,
+                "a": a,
+                "b": b,
+                "avg_score": round((int(a["probability"]) + int(b["probability"])) / 2, 1),
+            })
+            pair_no += 1
+
+    return combos
+
+def format_combo_post(combo):
+    a, b = combo["a"], combo["b"]
+    ga, gb = a["_game"], b["_game"]
+
+    group_name = {
+        "asia_baseball": "KBO · NPB",
+        "mlb": "MLB",
+        "soccer": "축구",
+        "basketball": "농구",
+    }.get(combo["pick_group"], "SPORTS")
+
+    return (
+        f"🔥 <b>SPORT NOW FINAL COMBO</b>\\n\\n"
+        f"🏷 {html.escape(group_name)} · 조합 {combo['pair_no']}\\n\\n"
+        f"1️⃣ <b>{html.escape(ko_team(ga['away']))} vs {html.escape(ko_team(ga['home']))}</b>\\n"
+        f"🎯 {html.escape(ko_team(a['pick_team']))} · PRIME SCORE {a['probability']}\\n\\n"
+        f"2️⃣ <b>{html.escape(ko_team(gb['away']))} vs {html.escape(ko_team(gb['home']))}</b>\\n"
+        f"🎯 {html.escape(ko_team(b['pick_team']))} · PRIME SCORE {b['probability']}\\n\\n"
+        f"📊 조합 평균 SCORE: <b>{combo['avg_score']}</b>\\n"
+        f"💬 개별 분석을 통과한 상위 픽 중 같은 그룹의 두 경기를 조합했습니다.\\n\\n"
+        f"⚠️ 조합은 참고용 분석이며 결과를 보장하지 않습니다.\n"
+        f"🔑 가입코드: <b>{html.escape(PROMO_CODE)}</b>"
+    )
+
+def post_combo_picks(conn, picks):
+    if not ENABLE_COMBO_PICKS:
+        return
+
+    for combo in build_combo_posts(picks):
+        if combo_recently_posted(conn, combo["combo_key"]):
+            continue
+
+        try:
+            text = format_combo_post(combo)
+            send_telegram(text, promo_button=True)
+            conn.execute(
+                """INSERT INTO combo_pick_logs
+                   (combo_key, pick_group, combo_text, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (
+                    combo["combo_key"],
+                    combo["pick_group"],
+                    text,
+                    utcnow_iso(),
+                )
+            )
+            conn.commit()
+            log.info("COMBO PICK POSTED | %s", combo["combo_key"])
+            time.sleep(2)
+        except Exception:
+            log.exception("Combo pick post failed | %s", combo["combo_key"])
 
 def maybe_post_prematch_picks(conn):
     if not ENABLE_NEWS_PICKS:
@@ -1655,6 +1835,7 @@ def maybe_post_prematch_picks(conn):
         return
 
     remaining = MAX_PICKS_PER_DAY - used
+    posted_picks = []
 
     group_counts = group_pick_counts_last_24h(conn)
 
@@ -1672,7 +1853,7 @@ def maybe_post_prematch_picks(conn):
 
         try:
             text = format_prematch_pick(pick, news_items)
-            send_telegram(text)
+            send_telegram(text, promo_button=True)
 
             now = utcnow_iso()
 
@@ -1712,6 +1893,8 @@ def maybe_post_prematch_picks(conn):
             if grp in group_counts:
                 group_counts[grp] += 1
 
+            posted_picks.append(pick)
+
             log.info(
                 "PREMATCH PICK POSTED | %s vs %s | pick=%s | %s%%",
                 g["away"], g["home"], pick["pick_team"], pick["probability"]
@@ -1720,6 +1903,11 @@ def maybe_post_prematch_picks(conn):
 
         except Exception:
             log.exception("Prematch pick send/store failed | %s", event_id)
+
+
+    # 개별 픽 게시 완료 후, 실제 게시된 픽들로만 최종 2폴 조합 생성
+    if posted_picks:
+        post_combo_picks(conn, posted_picks)
 
 
 # =========================
@@ -1965,7 +2153,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v10.2 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v11.4 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),

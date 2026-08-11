@@ -1,7 +1,16 @@
-# SPORT NOW v10.2
+# SPORT NOW v11.3 — Omakase Inline Button
 
-수정:
-- ESPN summary의 `news` 필드가 dict로 오는 경우 발생하던
-  `KeyError: slice(None, 5, None)` 오류 수정
-- list/dict/기타 응답 모두 안전하게 처리
-- 기존 팀명 한글화 / PRIME SCORE / 야구 모델 / 픽 결과 기록 유지
+개별 PRIME PICK / FINAL COMBO 글에 텔레그램 인라인 버튼을 표시합니다.
+
+버튼:
+🎰 오마카세 바로가기
+
+본문:
+가입코드 USDT 표시
+
+Railway Variables:
+PROMO_URL=https://om-1224.com/?code=usdt
+PROMO_BUTTON_TEXT=🎰 오마카세 바로가기
+PROMO_CODE=USDT
+
+결과글에는 버튼을 붙이지 않고, 분석픽과 조합픽에만 붙도록 설정했습니다.
