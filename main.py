@@ -50,6 +50,7 @@ REQUIRE_CONFIRMED_LINEUP = os.getenv("REQUIRE_CONFIRMED_LINEUP", "true").lower()
 LINEUP_MIN_PLAYERS = int(os.getenv("LINEUP_MIN_PLAYERS", "7"))
 ENABLE_ASIA_LINEUP_FALLBACK = os.getenv("ENABLE_ASIA_LINEUP_FALLBACK", "true").lower() == "true"
 KBO_NAVER_GATEWAY = os.getenv("KBO_NAVER_GATEWAY", "https://api-gw.sports.naver.com")
+KBO_NAVER_MOBILE = os.getenv("KBO_NAVER_MOBILE", "https://m.sports.naver.com/kbaseball")
 NPB_YAHOO_BASE = os.getenv("NPB_YAHOO_BASE", "https://baseball.yahoo.co.jp")
 
 ENABLE_COMBO_PICKS = os.getenv("ENABLE_COMBO_PICKS", "true").lower() == "true"
@@ -1367,6 +1368,68 @@ def _find_lineup_lists(obj, path=""):
             found.extend(_find_lineup_lists(x, f"{path}[{i}]"))
     return found
 
+
+def _team_aliases_kbo(name):
+    m={
+        "LG":["LG","LG 트윈스"],"HANWHA":["HANWHA","한화","한화 이글스"],
+        "SSG":["SSG","SSG 랜더스"],"SAMSUNG":["SAMSUNG","삼성","삼성 라이온즈"],
+        "NC":["NC","NC 다이노스"],"KT":["KT","KT 위즈"],"LOTTE":["LOTTE","롯데","롯데 자이언츠"],
+        "KIA":["KIA","KIA 타이거즈"],"DOOSAN":["DOOSAN","두산","두산 베어스"],
+        "KIWOOM":["KIWOOM","키움","키움 히어로즈"],
+    }
+    return m.get(str(name or "").upper(), [str(name or "")])
+
+def _extract_json_blobs_from_html(txt):
+    out=[]
+    soup=BeautifulSoup(txt,"html.parser")
+    for sc in soup.find_all("script"):
+        raw=(sc.string or sc.get_text("",strip=False) or "").strip()
+        if not raw: continue
+        if sc.get("type")=="application/json" or sc.get("id")=="__NEXT_DATA__":
+            try: out.append(json.loads(raw))
+            except: pass
+    return out
+
+def fetch_kbo_naver_mobile_lineup(game):
+    try:
+        start=datetime.fromisoformat(game["start_utc"]).astimezone(timezone(timedelta(hours=9)))
+        ds=start.strftime("%Y%m%d")
+        url=f"{KBO_NAVER_MOBILE.rstrip('/')}/schedule/index"
+        r=requests.get(url,params={"date":ds},headers={"User-Agent":"Mozilla/5.0","Referer":"https://m.sports.naver.com/"},timeout=15)
+        if r.status_code!=200:
+            return {"home":[],"away":[],"source":""}
+        ha=_team_aliases_kbo(game.get("home")); aa=_team_aliases_kbo(game.get("away"))
+        candidates=[]
+        soup=BeautifulSoup(r.text,"html.parser")
+        for a in soup.find_all("a",href=True):
+            blob=re.sub(r"\s+"," ",a.get_text(" ",strip=True))+" "+a["href"]
+            if any(x in blob for x in ha) and any(x in blob for x in aa):
+                href=a["href"]
+                candidates.append(href if href.startswith("http") else "https://m.sports.naver.com"+href)
+        blobs=_extract_json_blobs_from_html(r.text)
+        for b in blobs:
+            hits=_find_lineup_lists(b)
+            uniq=[]
+            for _,ns in hits:
+                if LINEUP_MIN_PLAYERS<=len(ns)<=18 and ns not in uniq: uniq.append(ns)
+            if len(uniq)>=2:
+                return {"home":uniq[0][:9],"away":uniq[1][:9],"source":"Naver Sports Mobile JSON"}
+        for cu in candidates[:8]:
+            try:
+                gr=requests.get(cu,headers={"User-Agent":"Mozilla/5.0","Referer":url},timeout=15)
+                if gr.status_code!=200: continue
+                for b in _extract_json_blobs_from_html(gr.text):
+                    hits=_find_lineup_lists(b); uniq=[]
+                    for _,ns in hits:
+                        if LINEUP_MIN_PLAYERS<=len(ns)<=18 and ns not in uniq: uniq.append(ns)
+                    if len(uniq)>=2:
+                        return {"home":uniq[0][:9],"away":uniq[1][:9],"source":"Naver Sports Mobile JSON"}
+            except: pass
+        return {"home":[],"away":[],"source":""}
+    except Exception:
+        log.exception("KBO Naver mobile lineup fetch failed")
+        return {"home":[],"away":[],"source":""}
+
 def fetch_kbo_naver_lineup(game):
     if not ENABLE_ASIA_LINEUP_FALLBACK:
         return {"home": [], "away": [], "source": ""}
@@ -1507,7 +1570,9 @@ def fetch_npb_yahoo_lineup(game):
 
 def enrich_asia_lineup(game):
     if game.get("league") == "KBO":
-        info = fetch_kbo_naver_lineup(game)
+        info = fetch_kbo_naver_mobile_lineup(game)
+        if not info.get("home") or not info.get("away"):
+            info = fetch_kbo_naver_lineup(game)
     elif game.get("league") == "NPB":
         info = fetch_npb_yahoo_lineup(game)
     else:
@@ -2354,7 +2419,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v11.5 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v11.6 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
