@@ -48,6 +48,10 @@ BASEBALL_FORM_WEIGHT = float(os.getenv("BASEBALL_FORM_WEIGHT", "0.15"))
 BASEBALL_LINEUP_WEIGHT = float(os.getenv("BASEBALL_LINEUP_WEIGHT", "0.10"))
 REQUIRE_CONFIRMED_LINEUP = os.getenv("REQUIRE_CONFIRMED_LINEUP", "true").lower() == "true"
 LINEUP_MIN_PLAYERS = int(os.getenv("LINEUP_MIN_PLAYERS", "7"))
+ENABLE_ASIA_LINEUP_FALLBACK = os.getenv("ENABLE_ASIA_LINEUP_FALLBACK", "true").lower() == "true"
+KBO_NAVER_GATEWAY = os.getenv("KBO_NAVER_GATEWAY", "https://api-gw.sports.naver.com")
+NPB_YAHOO_BASE = os.getenv("NPB_YAHOO_BASE", "https://baseball.yahoo.co.jp")
+
 ENABLE_COMBO_PICKS = os.getenv("ENABLE_COMBO_PICKS", "true").lower() == "true"
 COMBO_MIN_SCORE = int(os.getenv("COMBO_MIN_SCORE", "55"))
 COMBO_MAX_PER_GROUP = int(os.getenv("COMBO_MAX_PER_GROUP", "2"))
@@ -1326,6 +1330,198 @@ def news_side_signals(game, news_items):
     return result
 
 
+
+def _extract_names_from_json(obj):
+    names = []
+    if isinstance(obj, dict):
+        for key in ("name", "playerName", "displayName", "fullName", "shortName"):
+            v = obj.get(key)
+            if isinstance(v, str):
+                v = re.sub(r"\s+", " ", v).strip()
+                if v and v not in names:
+                    names.append(v)
+        for v in obj.values():
+            for n in _extract_names_from_json(v):
+                if n not in names:
+                    names.append(n)
+    elif isinstance(obj, list):
+        for x in obj:
+            for n in _extract_names_from_json(x):
+                if n not in names:
+                    names.append(n)
+    return names
+
+def _find_lineup_lists(obj, path=""):
+    found = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kp = f"{path}.{k}" if path else str(k)
+            kl = str(k).lower()
+            if isinstance(v, list) and any(t in kl for t in ("lineup", "starter", "starting", "battingorder", "batters")):
+                ns = _extract_names_from_json(v)
+                if LINEUP_MIN_PLAYERS <= len(ns) <= 18:
+                    found.append((kp, ns))
+            found.extend(_find_lineup_lists(v, kp))
+    elif isinstance(obj, list):
+        for i, x in enumerate(obj):
+            found.extend(_find_lineup_lists(x, f"{path}[{i}]"))
+    return found
+
+def fetch_kbo_naver_lineup(game):
+    if not ENABLE_ASIA_LINEUP_FALLBACK:
+        return {"home": [], "away": [], "source": ""}
+
+    try:
+        start = datetime.fromisoformat(game["start_utc"]).astimezone(timezone(timedelta(hours=9)))
+        ds = start.strftime("%Y-%m-%d")
+        r = requests.get(
+            f"{KBO_NAVER_GATEWAY.rstrip('/')}/schedule/games",
+            params={"upperCategoryId": "kbaseball", "fromDate": ds, "toDate": ds},
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.sports.naver.com/"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"home": [], "away": [], "source": ""}
+
+        data = r.json()
+        game_id = None
+
+        def walk_games(obj):
+            nonlocal game_id
+            if game_id:
+                return
+            if isinstance(obj, dict):
+                blob = json.dumps(obj, ensure_ascii=False).lower()
+                if str(game.get("home", "")).lower() in blob and str(game.get("away", "")).lower() in blob:
+                    gid = obj.get("gameId") or obj.get("game_id") or obj.get("id")
+                    if gid:
+                        game_id = gid
+                        return
+                for v in obj.values():
+                    walk_games(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    walk_games(v)
+
+        walk_games(data)
+        if not game_id:
+            return {"home": [], "away": [], "source": ""}
+
+        rr = requests.get(
+            f"{KBO_NAVER_GATEWAY.rstrip('/')}/schedule/games/{game_id}/relay",
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.sports.naver.com/"},
+            timeout=15,
+        )
+        if rr.status_code != 200:
+            return {"home": [], "away": [], "source": ""}
+
+        hits = _find_lineup_lists(rr.json())
+        uniq = []
+        for _, ns in hits:
+            if ns not in uniq:
+                uniq.append(ns)
+
+        if len(uniq) >= 2:
+            return {"home": uniq[0][:9], "away": uniq[1][:9], "source": "Naver Sports"}
+
+        return {"home": [], "away": [], "source": ""}
+    except Exception:
+        log.exception("KBO Naver lineup fetch failed")
+        return {"home": [], "away": [], "source": ""}
+
+def fetch_npb_yahoo_lineup(game):
+    if not ENABLE_ASIA_LINEUP_FALLBACK:
+        return {"home": [], "away": [], "source": ""}
+
+    try:
+        r = requests.get(
+            f"{NPB_YAHOO_BASE.rstrip('/')}/npb/",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return {"home": [], "away": [], "source": ""}
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        team_alias = {
+            "巨人": ["巨人", "読売"], "DeNA": ["DeNA", "横浜"], "ヤクルト": ["ヤクルト", "東京ヤクルト"],
+            "阪神": ["阪神"], "広島": ["広島"], "中日": ["中日"], "日本ハム": ["日本ハム", "北海道日本ハム"],
+            "ロッテ": ["ロッテ", "千葉ロッテ"], "楽天": ["楽天", "東北楽天"],
+            "ソフトバンク": ["ソフトバンク", "福岡ソフトバンク"], "西武": ["西武", "埼玉西武"],
+            "オリックス": ["オリックス"],
+        }
+        hv = team_alias.get(game.get("home"), [str(game.get("home", ""))])
+        av = team_alias.get(game.get("away"), [str(game.get("away", ""))])
+
+        href = None
+        for a in soup.find_all("a", href=True):
+            h = a.get("href", "")
+            if "/npb/game/" not in h:
+                continue
+            txt = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+            if any(x in txt for x in hv) and any(x in txt for x in av):
+                href = h
+                break
+
+        if not href:
+            return {"home": [], "away": [], "source": ""}
+
+        url = href if href.startswith("http") else NPB_YAHOO_BASE.rstrip("/") + href
+        gr = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        if gr.status_code != 200:
+            return {"home": [], "away": [], "source": ""}
+
+        gsoup = BeautifulSoup(gr.text, "html.parser")
+        page = gsoup.get_text("\n", strip=True)
+        if "スタメン" not in page and "オーダー" not in page:
+            return {"home": [], "away": [], "source": ""}
+
+        lineups = []
+        for table in gsoup.find_all("table"):
+            txt = table.get_text(" ", strip=True)
+            if "スタメン" not in txt and "オーダー" not in txt:
+                continue
+
+            names = []
+            for tr in table.find_all("tr"):
+                cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+                if not cells:
+                    continue
+                joined = " ".join(cells)
+                if re.search(r"(^|\s)[1-9](\s|$)", joined):
+                    for c in cells:
+                        if re.search(r"[一-龥ぁ-んァ-ンA-Za-z]", c) and len(c) <= 24:
+                            if c not in names:
+                                names.append(c)
+                                break
+            if len(names) >= LINEUP_MIN_PLAYERS:
+                lineups.append(names[:9])
+
+        if len(lineups) >= 2:
+            return {"home": lineups[0], "away": lineups[1], "source": "SportsNavi"}
+
+        return {"home": [], "away": [], "source": ""}
+    except Exception:
+        log.exception("NPB SportsNavi lineup fetch failed")
+        return {"home": [], "away": [], "source": ""}
+
+def enrich_asia_lineup(game):
+    if game.get("league") == "KBO":
+        info = fetch_kbo_naver_lineup(game)
+    elif game.get("league") == "NPB":
+        info = fetch_npb_yahoo_lineup(game)
+    else:
+        return game
+
+    if info.get("home"):
+        game["home_lineup"] = info["home"]
+    if info.get("away"):
+        game["away_lineup"] = info["away"]
+    if info.get("source"):
+        game["lineup_source"] = info["source"]
+    return game
+
+
 def detect_confirmed_lineup(game):
     """실제 응답에 양 팀 선발 명단이 있을 때만 확정으로 판단."""
     def names(side):
@@ -1410,6 +1606,9 @@ def select_prematch_top_picks(games, news_items):
     if REQUIRE_CONFIRMED_LINEUP:
         kept=[]
         for g in games:
+            if g.get("league") in ("KBO", "NPB"):
+                g = enrich_asia_lineup(g)
+
             baseball = g.get("sport")=="baseball" or g.get("league") in ("KBO","NPB","MLB")
             if not baseball:
                 kept.append(g); continue
@@ -1418,9 +1617,11 @@ def select_prematch_top_picks(games, news_items):
             if st["confirmed"]:
                 kept.append(g)
             else:
-                log.info("Waiting confirmed lineup | %s | %s vs %s | home=%d away=%d",
-                         g.get("league"),g.get("away"),g.get("home"),
-                         st["home_count"],st["away_count"])
+                log.info(
+                    "Waiting confirmed lineup | %s | %s vs %s | home=%d away=%d | source=%s",
+                    g.get("league"), g.get("away"), g.get("home"),
+                    st["home_count"], st["away_count"], g.get("lineup_source", "none")
+                )
         games=kept
     if not games:
         log.info("No eligible games with confirmed lineup")
@@ -2153,7 +2354,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v11.4 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v11.5 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
