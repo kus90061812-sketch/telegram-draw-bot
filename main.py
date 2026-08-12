@@ -1163,6 +1163,120 @@ def fetch_kleague_official_games():
     return list(out.values())
 
 
+
+def _looks_like_mlb_summary(summary):
+    text = _sr_context_text(summary)
+    return "mlb" in text or "major league baseball" in text or "major league" in text
+
+
+def fetch_sportradar_mlb_upcoming_games():
+    """MLB schedule comes directly from Sportradar so event_id is valid for lineups."""
+    if not SPORTRADAR_API_KEY:
+        log.info("MLB Sportradar schedule skipped | API key missing")
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+
+    # MLB games can cross UTC dates, so scan yesterday/today/tomorrow.
+    dates = {
+        (now_utc + timedelta(days=d)).strftime("%Y-%m-%d")
+        for d in (-1, 0, 1)
+    }
+    games = {}
+
+    try:
+        for date_str in sorted(dates):
+            url = (
+                f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
+                f"{SPORTRADAR_LANGUAGE}/schedules/{date_str}/summaries.json"
+            )
+            r = requests.get(url, headers=_sportradar_headers(), timeout=20)
+
+            if r.status_code != 200:
+                log.warning(
+                    "MLB Sportradar schedule failed | %s | HTTP %s | %s",
+                    date_str, r.status_code, r.text[:160]
+                )
+                continue
+
+            for summary in _iter_sr_summaries(r.json()):
+                ev = summary.get("sport_event") or {}
+                eid = ev.get("id")
+                if not eid:
+                    continue
+
+                comps = _sr_event_competitors(summary)
+                if len(comps) < 2:
+                    continue
+
+                home_comp = next((c for c in comps if c.get("qualifier") == "home"), None)
+                away_comp = next((c for c in comps if c.get("qualifier") == "away"), None)
+                if not home_comp or not away_comp:
+                    continue
+
+                # Strongest filter: both competitors must match our MLB alias table.
+                home_name = None
+                away_name = None
+
+                for code in MLB_SR_ALIASES:
+                    if _sr_team_matches(code, home_comp, "MLB"):
+                        home_name = code
+                        break
+                for code in MLB_SR_ALIASES:
+                    if _sr_team_matches(code, away_comp, "MLB"):
+                        away_name = code
+                        break
+
+                if not home_name or not away_name:
+                    continue
+
+                if not _looks_like_mlb_summary(summary):
+                    log.debug(
+                        "MLB context weak but teams matched | %s | %s vs %s",
+                        eid, away_comp.get("name"), home_comp.get("name")
+                    )
+
+                start_raw = ev.get("start_time")
+                if not start_raw:
+                    continue
+
+                try:
+                    start_utc = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+
+                # No prematch minute window, but exclude already-started games.
+                if start_utc <= now_utc:
+                    continue
+
+                games[eid] = {
+                    "event_id": eid,
+                    "sport": "baseball",
+                    "league": "MLB",
+                    "pick_group": "mlb",
+                    "home": home_name,
+                    "away": away_name,
+                    "start_utc": start_utc.isoformat(),
+                    "minutes_to_start": round((start_utc - now_utc).total_seconds() / 60),
+                    "source": "Sportradar",
+                    "sportradar_event_id": eid,
+                    "sportradar_home_id": home_comp.get("id", ""),
+                    "sportradar_away_id": away_comp.get("id", ""),
+                    "sportradar_home_name": home_comp.get("name", ""),
+                    "sportradar_away_name": away_comp.get("name", ""),
+                }
+
+        if games:
+            log.info("MLB Sportradar schedule candidates | count=%d", len(games))
+        else:
+            log.info("MLB Sportradar schedule | no upcoming games")
+
+    except Exception:
+        log.exception("MLB Sportradar schedule fetch failed")
+
+    return list(games.values())
+
+
 def fetch_sportradar_kbo_upcoming_games():
     """KBO 일정 자체를 Sportradar Daily Summaries에서 생성한다."""
     if not SPORTRADAR_API_KEY:
@@ -1339,13 +1453,26 @@ def fetch_domestic_official_games():
 
 def fetch_major_upcoming_games():
     now = datetime.now(timezone.utc)
+
+    # Domestic KBO/NPB + football, etc.
     games = fetch_domestic_official_games()
+
+    # v13.3.11: MLB schedule is Sportradar-first so its event_id can be used
+    # directly by the Sport Event Lineups endpoint.
+    mlb_games = fetch_sportradar_mlb_upcoming_games()
+    games.extend(mlb_games)
+
     date_keys = {
         (now + timedelta(days=d)).strftime("%Y%m%d")
         for d in (-1, 0, 1, 2)
     }
 
     for sport, league, league_name, pick_group in MAJOR_LEAGUES:
+        # Do not fetch MLB from ESPN when Sportradar schedule is available.
+        # It previously caused ESPN event IDs to be sent to Sportradar lineups.
+        if league_name == "MLB" and mlb_games:
+            continue
+
         for date_key in date_keys:
             url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
 
@@ -1371,6 +1498,11 @@ def fetch_major_upcoming_games():
                         continue
 
                     start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+
+                    # No minute window, but this is PREMATCH: started games are excluded.
+                    if start <= now:
+                        continue
+
                     mins = (start - now).total_seconds() / 60
                     competitors = comp.get("competitors") or []
                     if len(competitors) < 2:
@@ -2183,10 +2315,15 @@ def enrich_asia_lineup(game):
             info = fetch_npb_yahoo_lineup(game)
 
     elif league == "MLB":
-        # 1순위 Sportradar
+        # Ensure we never send an ESPN event_id to Sportradar lineups.
+        if not game.get("sportradar_event_id"):
+            sr_event_id = fetch_sportradar_baseball_event_id(game)
+            if sr_event_id:
+                game["sportradar_event_id"] = sr_event_id
+
         info = fetch_sportradar_baseball_lineup(game)
-        # MLB는 기존 ESPN competitor/summary 구조가 detect_confirmed_lineup에서 fallback 역할
-        # Sportradar 실패 시 별도 강제 덮어쓰기 없이 기존 데이터 사용
+
+        # ESPN remains fallback only when Sportradar has no usable lineup.
         if not info.get("home") or not info.get("away"):
             return game
 
@@ -3008,7 +3145,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.10 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.11 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
