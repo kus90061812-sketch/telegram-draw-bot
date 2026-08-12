@@ -35,6 +35,7 @@ PREMATCH_MIN_MINUTES = int(os.getenv("PREMATCH_MIN_MINUTES", "45"))
 PREMATCH_MAX_MINUTES = int(os.getenv("PREMATCH_MAX_MINUTES", "70"))
 MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "20"))
 MIN_NEWS_EDGE = int(os.getenv("MIN_NEWS_EDGE", "55"))
+ENFORCE_SCORE_CUTOFF = False
 ENABLE_FREE_TEAM_DATA = os.getenv("ENABLE_FREE_TEAM_DATA", "true").lower() == "true"
 RECENT_GAMES_LOOKBACK = int(os.getenv("RECENT_GAMES_LOOKBACK", "5"))
 MAX_PICKS_PER_GROUP = int(os.getenv("MAX_PICKS_PER_GROUP", "4"))
@@ -2383,6 +2384,8 @@ def select_prematch_top_picks(games, news_items):
 - 기사 번호(ID 1, ID 59 같은 표기)를 문장에 절대 쓰지 않는다.
 - 팀명을 문장에 쓸 때는 가능한 한 자연스러운 한국어 팀명으로 표현한다.
 - 과장 표현, 확정적 표현, 결과 보장 표현은 금지.
+- PRIME SCORE는 참고용이다. 점수와 관계없이 분석 가능한 경기는 반환한다.
+- 점수 때문에 경기를 제외하지 않는다.
 - JSON 배열만 출력.
 
 [
@@ -3031,7 +3034,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.7 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.8 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
