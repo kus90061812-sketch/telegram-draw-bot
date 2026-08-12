@@ -55,6 +55,7 @@ SR_LINEUP_LOOKAHEAD_MINUTES = int(os.getenv("SR_LINEUP_LOOKAHEAD_MINUTES", "360"
 LINEUP_WAIT_UNTIL_MINUTES = int(os.getenv("LINEUP_WAIT_UNTIL_MINUTES", "30"))
 SR_REQUEST_SPACING_SECONDS = float(os.getenv("SR_REQUEST_SPACING_SECONDS", "1.5"))
 SR_429_BACKOFF_SECONDS = int(os.getenv("SR_429_BACKOFF_SECONDS", "900"))
+SR_429_MAX_BACKOFF_SECONDS = int(os.getenv("SR_429_MAX_BACKOFF_SECONDS", "3600"))
 TELEGRAM_POST_INTERVAL_SECONDS = int(os.getenv("TELEGRAM_POST_INTERVAL_SECONDS", "120"))
 
 NPB_YAHOO_BASE = os.getenv("NPB_YAHOO_BASE", "https://baseball.yahoo.co.jp")
@@ -1236,13 +1237,27 @@ def app_state_set(conn, key, value):
     conn.commit()
 
 
-def _sr_get_json(url, params=None, label="Sportradar"):
-    """Single shared Sportradar request path with spacing + 429 backoff."""
+def _sr_get_json(url, params=None, label="Sportradar", conn=None):
+    """Shared Sportradar client: QPS spacing + persistent 429 cooldown + diagnostics."""
     global _SR_LAST_REQUEST_AT, _SR_BACKOFF_UNTIL
+
+    # Persistent cooldown survives Railway restarts/redeploys.
+    now_epoch = time.time()
+    persisted_until = 0.0
+    if conn is not None:
+        try:
+            persisted_until = float(app_state_get(conn, "sportradar_backoff_until", "0") or 0)
+        except Exception:
+            persisted_until = 0.0
+
+    if now_epoch < persisted_until:
+        wait = max(1, round(persisted_until - now_epoch))
+        log.warning("%s skipped | persistent Sportradar backoff active | %ss", label, wait)
+        return None
 
     now_mono = time.monotonic()
     if now_mono < _SR_BACKOFF_UNTIL:
-        wait = round(_SR_BACKOFF_UNTIL - now_mono)
+        wait = max(1, round(_SR_BACKOFF_UNTIL - now_mono))
         log.warning("%s skipped | Sportradar backoff active | %ss", label, wait)
         return None
 
@@ -1254,20 +1269,55 @@ def _sr_get_json(url, params=None, label="Sportradar"):
         r = requests.get(url, params=params, headers=_sportradar_headers(), timeout=20)
         _SR_LAST_REQUEST_AT = time.monotonic()
 
+        # Log rate-limit diagnostics without exposing API key or auth headers.
+        diag_names = (
+            "Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining",
+            "X-RateLimit-Reset", "RateLimit-Limit", "RateLimit-Remaining",
+            "RateLimit-Reset"
+        )
+        diag = {k: r.headers.get(k) for k in diag_names if r.headers.get(k) is not None}
+
         if r.status_code == 429:
             retry_after = r.headers.get("Retry-After")
             try:
-                backoff = max(int(retry_after), SR_429_BACKOFF_SECONDS)
+                retry_seconds = int(float(retry_after))
             except Exception:
-                backoff = SR_429_BACKOFF_SECONDS
+                retry_seconds = SR_429_BACKOFF_SECONDS
+
+            backoff = min(
+                max(retry_seconds, SR_429_BACKOFF_SECONDS),
+                SR_429_MAX_BACKOFF_SECONDS
+            )
             _SR_BACKOFF_UNTIL = time.monotonic() + backoff
-            log.warning("%s | HTTP 429 Too Many Requests | backoff=%ss", label, backoff)
+            until_epoch = time.time() + backoff
+
+            if conn is not None:
+                try:
+                    app_state_set(conn, "sportradar_backoff_until", str(until_epoch))
+                except Exception:
+                    log.exception("Failed to persist Sportradar backoff")
+
+            log.warning(
+                "%s | HTTP 429 Too Many Requests | backoff=%ss | headers=%s | body=%s",
+                label, backoff, diag, r.text[:180]
+            )
             return None
 
         if r.status_code != 200:
-            log.warning("%s | HTTP %s | %s", label, r.status_code, r.text[:220])
+            log.warning(
+                "%s | HTTP %s | headers=%s | body=%s",
+                label, r.status_code, diag, r.text[:220]
+            )
             return None
 
+        # Successful request clears an expired persisted cooldown.
+        if conn is not None and persisted_until:
+            try:
+                app_state_set(conn, "sportradar_backoff_until", "0")
+            except Exception:
+                pass
+
+        log.debug("%s | HTTP 200 | headers=%s", label, diag)
         return r.json()
 
     except Exception:
@@ -1406,7 +1456,7 @@ def refresh_baseball_schedule_cache(conn, force=False):
             f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
             f"{SPORTRADAR_LANGUAGE}/schedules/{date_str}/summaries.json"
         )
-        data = _sr_get_json(url, label=f"Baseball schedule {date_str}")
+        data = _sr_get_json(url, label=f"Baseball schedule {date_str}", conn=conn)
         if data is None:
             # If shared client entered 429 backoff, stop this refresh immediately.
             if time.monotonic() < _SR_BACKOFF_UNTIL:
@@ -2401,7 +2451,7 @@ def _sr_starters(competitor):
     )
     return starters
 
-def fetch_sportradar_baseball_lineup(game):
+def fetch_sportradar_baseball_lineup(game, conn=None):
     """Official Global Baseball v2 Sport Event Lineups parser.
 
     Endpoint:
@@ -2427,7 +2477,7 @@ def fetch_sportradar_baseball_lineup(game):
         f"{SPORTRADAR_LANGUAGE}/sport_events/{event_id}/lineups.json"
     )
 
-    data = _sr_get_json(url, label=f"{league} lineup {event_id}")
+    data = _sr_get_json(url, label=f"{league} lineup {event_id}", conn=conn)
     if data is None:
         return {"home": [], "away": [], "source": "", "confirmed": False}
 
@@ -2831,7 +2881,7 @@ def enrich_asia_lineup(game, conn=None):
 
     # Call Sportradar lineups only with a real Global Baseball sport_event_id.
     if str(game.get("sportradar_event_id") or "").startswith("sr:sport_event:"):
-        info = fetch_sportradar_baseball_lineup(game)
+        info = fetch_sportradar_baseball_lineup(game, conn)
     else:
         info = {"home": [], "away": [], "source": "", "confirmed": False}
 
@@ -3736,7 +3786,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v14.7.1 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.8 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
