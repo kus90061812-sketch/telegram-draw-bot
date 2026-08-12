@@ -1844,28 +1844,42 @@ def _sr_starters(competitor):
 
 def fetch_sportradar_baseball_lineup(game):
     """Parse Global Baseball Sport Event Lineups using starter=true."""
-    league = str(league).upper()
-    event_id = str(event_id or "")
+    league = str(game.get("league") or "").upper()
+    event_id = str(
+        game.get("sportradar_event_id")
+        or game.get("event_id")
+        or ""
+    )
+
     if not event_id:
-        return None
+        log.info("Sportradar %s lineup skipped | event_id missing", league or "BASEBALL")
+        return {"home": [], "away": [], "source": ""}
 
     url = (
         f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
         f"{SPORTRADAR_LANGUAGE}/sport_events/{event_id}/lineups.json"
     )
+
     try:
         r = requests.get(url, headers=_sportradar_headers(), timeout=20)
+
         if r.status_code != 200:
-            log.warning("Sportradar %s lineups HTTP %s | event=%s | %s",
-                        league, r.status_code, event_id, r.text[:250])
-            return None
+            log.warning(
+                "Sportradar %s lineups HTTP %s | event=%s | body=%s",
+                league, r.status_code, event_id, r.text[:250]
+            )
+            return {"home": [], "away": [], "source": ""}
 
         data = r.json()
-        log.info("Sportradar %s lineups response | event=%s | keys=%s",
-                 league, event_id, list(data.keys()))
+
+        log.info(
+            "Sportradar %s lineups response | event=%s | keys=%s",
+            league, event_id, list(data.keys())
+        )
 
         node = data.get("lineups")
         competitors = []
+
         if isinstance(node, dict):
             competitors = node.get("competitors") or node.get("competitor") or []
         elif isinstance(node, list):
@@ -1877,48 +1891,88 @@ def fetch_sportradar_baseball_lineup(game):
         if isinstance(competitors, dict):
             competitors = competitors.get("competitor") or list(competitors.values())
 
-        home_all=[]; away_all=[]; home=[]; away=[]
+        home_all = []
+        away_all = []
+        home_starters = []
+        away_starters = []
+
         for comp in competitors or []:
             if not isinstance(comp, dict):
                 continue
-            q = str(comp.get("qualifier","")).lower()
+
+            qualifier = str(comp.get("qualifier") or "").lower()
             players = comp.get("players") or []
+
             if isinstance(players, dict):
                 players = players.get("player") or list(players.values())
-            players = [x for x in players if isinstance(x,dict)]
-            starters = [x for x in players if x.get("starter") is True]
-            starters.sort(key=lambda x: (x.get("order") is None, x.get("order",999)))
-            if q == "home":
-                home_all, home = players, starters
-            elif q == "away":
-                away_all, away = players, starters
 
-        coverage = ((data.get("sport_event") or {}).get("coverage")
-                    or data.get("coverage") or {})
+            players = [x for x in players if isinstance(x, dict)]
+            starters = [x for x in players if x.get("starter") is True]
+
+            starters.sort(
+                key=lambda x: (
+                    x.get("order") is None,
+                    x.get("order", 999)
+                )
+            )
+
+            if qualifier == "home":
+                home_all = players
+                home_starters = starters
+            elif qualifier == "away":
+                away_all = players
+                away_starters = starters
+
+        coverage = (
+            (data.get("sport_event") or {}).get("coverage")
+            or data.get("coverage")
+            or {}
+        )
+
         log.info(
             "Sportradar %s lineup parsed | event=%s | competitors=%d | "
             "home_players=%d away_players=%d | home_starters=%d away_starters=%d | coverage=%s",
             league, event_id, len(competitors or []),
-            len(home_all), len(away_all), len(home), len(away), str(coverage)[:250]
+            len(home_all), len(away_all),
+            len(home_starters), len(away_starters),
+            str(coverage)[:250]
         )
 
-        if not home or not away:
+        if not home_starters or not away_starters:
             log.info(
                 "Sportradar %s lineup unavailable | event=%s | home=%d away=%d | lineups_type=%s",
-                league, event_id, len(home), len(away), type(node).__name__
+                league, event_id, len(home_starters), len(away_starters),
+                type(node).__name__
             )
-            return None
+            return {"home": [], "away": [], "source": ""}
 
-        def compact(players):
-            return [{"id":x.get("id"),"name":x.get("name"),"type":x.get("type"),
-                     "order":x.get("order"),"starter":True} for x in players]
+        def player_names(players):
+            names = []
+            for x in players:
+                name = str(x.get("name") or "").strip()
+                if name:
+                    names.append(name)
+            return names
 
-        return {"source":"sportradar","confirmed":True,
-                "home":compact(home),"away":compact(away),
-                "home_count":len(home),"away_count":len(away)}
+        home_names = player_names(home_starters)
+        away_names = player_names(away_starters)
+
+        game["home_lineup_detail"] = home_starters
+        game["away_lineup_detail"] = away_starters
+        game["lineup_source"] = "Sportradar"
+
+        return {
+            "home": home_names,
+            "away": away_names,
+            "source": "Sportradar",
+        }
+
     except Exception:
-        log.exception("Sportradar %s lineup fetch/parse failed | event=%s", league, event_id)
-        return None
+        log.exception(
+            "Sportradar %s lineup fetch/parse failed | event=%s",
+            league, event_id
+        )
+        return {"home": [], "away": [], "source": ""}
 
 
 def _team_aliases_kbo(name):
@@ -2977,7 +3031,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.6 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.7 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
