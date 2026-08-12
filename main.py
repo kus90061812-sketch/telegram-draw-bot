@@ -1843,62 +1843,82 @@ def _sr_starters(competitor):
     return starters
 
 def fetch_sportradar_baseball_lineup(game):
-    """KBO/NPB/MLB 공통 Sport Event Lineups."""
-    league = game.get("league")
-    if league not in ("KBO", "NPB", "MLB") or not SPORTRADAR_API_KEY:
-        return {"home": [], "away": [], "source": ""}
-
-    event_id = game.get("sportradar_event_id") or fetch_sportradar_baseball_event_id(game)
+    """Parse Global Baseball Sport Event Lineups using starter=true."""
+    league = str(league).upper()
+    event_id = str(event_id or "")
     if not event_id:
-        return {"home": [], "away": [], "source": ""}
+        return None
 
-    game["sportradar_event_id"] = event_id
-
+    url = (
+        f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
+        f"{SPORTRADAR_LANGUAGE}/sport_events/{event_id}/lineups.json"
+    )
     try:
-        url = (
-            f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
-            f"{SPORTRADAR_LANGUAGE}/sport_events/{event_id}/lineups.json"
-        )
         r = requests.get(url, headers=_sportradar_headers(), timeout=20)
-
         if r.status_code != 200:
-            log.info("Sportradar %s Lineups unavailable | %s | HTTP %s",
-                     league, event_id, r.status_code)
-            return {"home": [], "away": [], "source": ""}
+            log.warning("Sportradar %s lineups HTTP %s | event=%s | %s",
+                        league, r.status_code, event_id, r.text[:250])
+            return None
 
-        competitors = _sr_lineup_competitors(r.json())
-        home_comp = next((c for c in competitors if c.get("qualifier") == "home"), None)
-        away_comp = next((c for c in competitors if c.get("qualifier") == "away"), None)
+        data = r.json()
+        log.info("Sportradar %s lineups response | event=%s | keys=%s",
+                 league, event_id, list(data.keys()))
 
-        if not home_comp or not away_comp:
-            log.info("Sportradar %s Lineups missing competitors | %s", league, event_id)
-            return {"home": [], "away": [], "source": ""}
+        node = data.get("lineups")
+        competitors = []
+        if isinstance(node, dict):
+            competitors = node.get("competitors") or node.get("competitor") or []
+        elif isinstance(node, list):
+            competitors = node
 
-        home_starters = _sr_starters(home_comp)
-        away_starters = _sr_starters(away_comp)
+        if not competitors:
+            competitors = data.get("competitors") or []
 
-        home_names = [x["name"] for x in home_starters if x.get("name")]
-        away_names = [x["name"] for x in away_starters if x.get("name")]
+        if isinstance(competitors, dict):
+            competitors = competitors.get("competitor") or list(competitors.values())
 
-        game["home_lineup_detail"] = home_starters
-        game["away_lineup_detail"] = away_starters
+        home_all=[]; away_all=[]; home=[]; away=[]
+        for comp in competitors or []:
+            if not isinstance(comp, dict):
+                continue
+            q = str(comp.get("qualifier","")).lower()
+            players = comp.get("players") or []
+            if isinstance(players, dict):
+                players = players.get("player") or list(players.values())
+            players = [x for x in players if isinstance(x,dict)]
+            starters = [x for x in players if x.get("starter") is True]
+            starters.sort(key=lambda x: (x.get("order") is None, x.get("order",999)))
+            if q == "home":
+                home_all, home = players, starters
+            elif q == "away":
+                away_all, away = players, starters
 
-        if len(home_names) >= LINEUP_MIN_PLAYERS and len(away_names) >= LINEUP_MIN_PLAYERS:
-            log.info(
-                "Sportradar %s lineup confirmed | %s vs %s | home=%d away=%d",
-                league, game.get("away"), game.get("home"), len(home_names), len(away_names)
-            )
-            return {"home": home_names, "away": away_names, "source": "Sportradar"}
-
+        coverage = ((data.get("sport_event") or {}).get("coverage")
+                    or data.get("coverage") or {})
         log.info(
-            "Sportradar %s lineup not posted yet | %s vs %s | home=%d away=%d",
-            league, game.get("away"), game.get("home"), len(home_names), len(away_names)
+            "Sportradar %s lineup parsed | event=%s | competitors=%d | "
+            "home_players=%d away_players=%d | home_starters=%d away_starters=%d | coverage=%s",
+            league, event_id, len(competitors or []),
+            len(home_all), len(away_all), len(home), len(away), str(coverage)[:250]
         )
-        return {"home": [], "away": [], "source": ""}
 
+        if not home or not away:
+            log.info(
+                "Sportradar %s lineup unavailable | event=%s | home=%d away=%d | lineups_type=%s",
+                league, event_id, len(home), len(away), type(node).__name__
+            )
+            return None
+
+        def compact(players):
+            return [{"id":x.get("id"),"name":x.get("name"),"type":x.get("type"),
+                     "order":x.get("order"),"starter":True} for x in players]
+
+        return {"source":"sportradar","confirmed":True,
+                "home":compact(home),"away":compact(away),
+                "home_count":len(home),"away_count":len(away)}
     except Exception:
-        log.exception("Sportradar %s lineup fetch failed", league)
-        return {"home": [], "away": [], "source": ""}
+        log.exception("Sportradar %s lineup fetch/parse failed | event=%s", league, event_id)
+        return None
 
 
 def _team_aliases_kbo(name):
@@ -2957,7 +2977,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.5 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.6 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
