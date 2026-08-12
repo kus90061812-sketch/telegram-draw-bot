@@ -2318,7 +2318,7 @@ def select_prematch_top_picks(games, news_items):
     if not games:
         log.info("No eligible games with confirmed lineup")
         return []
-    if not games or len(news_items) < 3:
+    if not games:
         return []
 
     games = build_free_game_context(games)
@@ -2343,7 +2343,7 @@ def select_prematch_top_picks(games, news_items):
 너는 SPORT NOW 프리매치 인텔리전스 엔진이다.
 
 분석 대상은 아래 메이저리그 예정 경기만 허용한다.
-제공된 최근 뉴스만 근거로 사용하고 외부 지식, 기억, 임의 통계, 배당은 사용하지 않는다.
+제공된 경기 데이터와 라인업을 우선 사용하고, 최근 뉴스는 보조 근거로 사용한다. 외부 지식이나 기억으로 사실을 만들어내지 않는다.
 
 우선순위:
 1. 부상/결장
@@ -2353,14 +2353,14 @@ def select_prematch_top_picks(games, news_items):
 5. 감독의 출전 관련 공식 발언
 
 규칙:
-- 근거 없는 경기는 제외.
+- 경기 데이터와 라인업 등 분석 근거가 있으면 뉴스가 없어도 분석할 수 있다.
 - 절대 개수를 채우려고 하지 않는다.
 - 픽 개수 상한은 없다. 기준을 충족하는 경기는 모두 반환할 수 있다.
 - 각 pick_group에서 기준을 충족하는 모든 강한 경기를 검토한다.
 - KBO와 NPB는 서로 다른 그룹이며 절대 합산하지 않는다.
 - 같은 그룹이라도 기준을 충족하는 경기는 개수 제한 없이 유지한다.
-- 가장 근거가 강하고 한쪽 우세가 뚜렷한 경기만 출력한다.
-- 애매하면 빈 배열 []을 출력해도 된다.
+- 분석 가능한 경기는 점수와 관계없이 출력할 수 있다.
+- 데이터가 부족하거나 분석 자체가 불가능한 경기만 제외한다.
 - probability는 실제 통계 승률이 아니라 '무료 경기 데이터 + 뉴스 기반 AI 추정 우세도'.
 - base_home_edge는 최근 경기 성적/득실만으로 계산한 홈팀 기준점이다.
 - 야구 경기에는 baseball_model이 제공된다.
@@ -2372,9 +2372,8 @@ def select_prematch_top_picks(games, news_items):
 - 경기 시작 전 확인할 수 없는 '오늘 컨디션'은 추측하지 않는다.
 - component 차이가 작으면 강한 확신을 내리지 않는다.
 - 확정 부상/결장/라인업 정보가 강하면 조정할 수 있다.
-- probability는 {MIN_NEWS_EDGE}~75 정수.
+- probability는 1~99 정수이며 참고용 우세도다.
 - confidence는 high 또는 medium.
-- probability가 55 미만인 경기는 절대 출력하지 않는다.
 - high 신뢰도를 우선하고, medium은 근거가 충분할 때만 허용한다.
 - 종목/리그 인기도보다 실제 데이터 근거 강도를 우선한다.
 - pick_side는 반드시 "home" 또는 "away".
@@ -2416,7 +2415,7 @@ def select_prematch_top_picks(games, news_items):
     game_map = {str(g["event_id"]): g for g in games}
     result = []
 
-    for x in data[:4]:
+    for x in data:
         eid = str(x.get("event_id", ""))
         if eid not in game_map:
             continue
@@ -2430,7 +2429,7 @@ def select_prematch_top_picks(games, news_items):
         except Exception:
             continue
 
-        if not (MIN_NEWS_EDGE <= prob <= 75):
+        if not (1 <= prob <= 99):
             continue
 
         if x.get("confidence") not in ("high", "medium"):
@@ -2439,7 +2438,7 @@ def select_prematch_top_picks(games, news_items):
         source_ids = x.get("source_ids") or []
         reasons = x.get("reasons") or []
 
-        if not source_ids or not reasons:
+        if not reasons:
             continue
 
         g = game_map[eid]
@@ -2454,24 +2453,12 @@ def select_prematch_top_picks(games, news_items):
         reverse=True,
     )
 
-    # 그룹별 품질 우선: 억지로 채우지 않고 각 그룹 상위만.
-    grouped = {}
-    for item in result:
-        grp = item.get("pick_group", "other")
-        grouped.setdefault(grp, [])
-        if len(grouped[grp]) < max_picks_for_group(grp):
-            grouped[grp].append(item)
-
-    final = []
-    # 아시아 야구는 KBO+NPB를 한 묶음으로 먼저 비교
-    for grp in ("kbo", "npb", "mlb", "soccer", "basketball"):
-        final.extend(grouped.get(grp, []))
-
-    final.sort(
+    # v13.3.9: 개수 제한 없음. 분석 가능한 모든 픽 반환.
+    result.sort(
         key=lambda x: (x["confidence"] == "high", x["probability"]),
         reverse=True,
     )
-    return final
+    return result
 
 
 
@@ -2728,8 +2715,7 @@ def maybe_post_prematch_picks(conn):
 
     news_items = recent_news_for_picks(conn, 48, 100)
     if len(news_items) < 3:
-        log.info("Not enough cached news for prematch analysis")
-        return
+        log.info("Limited cached news | count=%d | continuing with game/lineup data", len(news_items))
 
     try:
         picks = select_prematch_top_picks(games, news_items)
@@ -3034,7 +3020,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.8 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.9 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
