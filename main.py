@@ -39,7 +39,6 @@ BASEBALL_OFFENSE_WEIGHT = float(os.getenv("BASEBALL_OFFENSE_WEIGHT", "0.25"))
 BASEBALL_BULLPEN_WEIGHT = float(os.getenv("BASEBALL_BULLPEN_WEIGHT", "0.20"))
 BASEBALL_FORM_WEIGHT = float(os.getenv("BASEBALL_FORM_WEIGHT", "0.15"))
 BASEBALL_LINEUP_WEIGHT = float(os.getenv("BASEBALL_LINEUP_WEIGHT", "0.10"))
-REQUIRE_CONFIRMED_LINEUP = os.getenv("REQUIRE_CONFIRMED_LINEUP", "true").lower() == "true"
 LINEUP_MIN_PLAYERS = int(os.getenv("LINEUP_MIN_PLAYERS", "7"))
 ENABLE_ASIA_LINEUP_FALLBACK = os.getenv("ENABLE_ASIA_LINEUP_FALLBACK", "true").lower() == "true"
 KBO_NAVER_GATEWAY = os.getenv("KBO_NAVER_GATEWAY", "https://api-gw.sports.naver.com")
@@ -53,6 +52,7 @@ ENABLE_SPORTRADAR_KBO = os.getenv("ENABLE_SPORTRADAR_KBO", "true").lower() == "t
 SR_SCHEDULE_REFRESH_SECONDS = int(os.getenv("SR_SCHEDULE_REFRESH_SECONDS", "1800"))
 SR_LINEUP_RECHECK_SECONDS = int(os.getenv("SR_LINEUP_RECHECK_SECONDS", "600"))
 SR_LINEUP_LOOKAHEAD_MINUTES = int(os.getenv("SR_LINEUP_LOOKAHEAD_MINUTES", "360"))
+LINEUP_WAIT_UNTIL_MINUTES = int(os.getenv("LINEUP_WAIT_UNTIL_MINUTES", "30"))
 SR_REQUEST_SPACING_SECONDS = float(os.getenv("SR_REQUEST_SPACING_SECONDS", "1.25"))
 SR_429_BACKOFF_SECONDS = int(os.getenv("SR_429_BACKOFF_SECONDS", "900"))
 TELEGRAM_POST_INTERVAL_SECONDS = int(os.getenv("TELEGRAM_POST_INTERVAL_SECONDS", "120"))
@@ -2770,7 +2770,8 @@ def detect_confirmed_lineup(game):
 
 def baseball_model_score(game, news_items):
     """KBO/NPB/MLB 전용 상대 우세 모델.
-    값은 승률이 아니라 0~100 PRIME SCORE."""
+    값은 승률이 아니라 0~100 PRIME SCORE.
+    라인업 정보가 없으면 lineup/news signal의 기본값 50(중립)을 사용한다."""
     signals = news_side_signals(game, news_items)
     hr = game.get("home_recent") or {}
     ar = game.get("away_recent") or {}
@@ -2826,30 +2827,55 @@ def baseball_model_score(game, news_items):
 
 
 def select_prematch_top_picks(games, news_items, conn=None):
-    if REQUIRE_CONFIRMED_LINEUP:
-        kept=[]
-        for g in games:
-            if g.get("league") in ("KBO", "NPB", "MLB"):
-                g = enrich_asia_lineup(g, conn)
+    # v14.6:
+    # Baseball waits for a confirmed lineup until 30 minutes before first pitch.
+    # If lineup is still unavailable at <=30 minutes, analysis proceeds without it.
+    enriched = []
+    for g in games:
+        if g.get("league") in ("KBO", "NPB", "MLB"):
+            g = enrich_asia_lineup(g, conn)
+            st = g.get("lineup_status") or detect_confirmed_lineup(g)
+            g["lineup_status"] = st
 
-            baseball = g.get("sport")=="baseball" or g.get("league") in ("KBO","NPB","MLB")
-            if not baseball:
-                kept.append(g); continue
-            st=g.get("lineup_status") or detect_confirmed_lineup(g)
-            g["lineup_status"]=st
-            if st["confirmed"]:
-                kept.append(g)
-            else:
+            try:
+                start_dt = datetime.fromisoformat(str(g.get("start_utc") or "").replace("Z", "+00:00"))
+                mins_to_start = (start_dt - datetime.now(timezone.utc)).total_seconds() / 60
+            except Exception:
+                mins_to_start = g.get("minutes_to_start")
+                try:
+                    mins_to_start = float(mins_to_start)
+                except Exception:
+                    mins_to_start = 999999
+
+            if st.get("confirmed"):
                 log.info(
-                    "Waiting confirmed lineup | %s | %s vs %s | home=%d away=%d | source=%s",
-                    g.get("league"), g.get("away"), g.get("home"),
-                    st["home_count"], st["away_count"], g.get("lineup_source", "none")
+                    "Lineup available -> analyze | %s | %s vs %s | %.1f min | home=%d away=%d | source=%s",
+                    g.get("league"), g.get("away"), g.get("home"), mins_to_start,
+                    st.get("home_count", 0), st.get("away_count", 0),
+                    g.get("lineup_source", "none")
                 )
-        games=kept
+            elif mins_to_start > LINEUP_WAIT_UNTIL_MINUTES:
+                log.info(
+                    "Waiting lineup until T-%dm | %s | %s vs %s | %.1f min | home=%d away=%d | source=%s",
+                    LINEUP_WAIT_UNTIL_MINUTES,
+                    g.get("league"), g.get("away"), g.get("home"), mins_to_start,
+                    st.get("home_count", 0), st.get("away_count", 0),
+                    g.get("lineup_source", "none")
+                )
+                continue
+            else:
+                g["lineup_deadline_fallback"] = True
+                log.warning(
+                    "T-%dm reached without lineup -> analyze without lineup | %s | %s vs %s | %.1f min",
+                    LINEUP_WAIT_UNTIL_MINUTES,
+                    g.get("league"), g.get("away"), g.get("home"), mins_to_start
+                )
+
+        enriched.append(g)
+
+    games = enriched
     if not games:
-        log.info("No eligible games with confirmed lineup")
-        return []
-    if not games:
+        log.info("No games ready for analysis yet")
         return []
 
     games = build_free_game_context(games)
@@ -2895,8 +2921,8 @@ def select_prematch_top_picks(games, news_items, conn=None):
 - probability는 실제 통계 승률이 아니라 '무료 경기 데이터 + 뉴스 기반 AI 추정 우세도'.
 - base_home_edge는 최근 경기 성적/득실만으로 계산한 홈팀 기준점이다.
 - 야구 경기에는 baseball_model이 제공된다.
-- lineup_status.confirmed=true인 야구 경기만 최종 분석한다.
-- 확인되지 않은 출전 명단은 임의로 추측하지 않는다.
+- 야구 라인업은 확보되면 반드시 반영한다. 경기 30분 전까지 라인업이 확보되지 않은 경우에만 라인업 없이 나머지 검증된 데이터로 분석한다.
+- 확인되지 않은 출전 명단은 임의로 추측하지 않는다. 라인업이 없으면 그 항목은 중립 정보로 두고 다른 검증된 데이터로 판단한다.
 - KBO/NPB/MLB는 반드시 baseball_model을 우선 참고한다.
 - 야구 가중치는 선발 30%, 타선 25%, 불펜 20%, 최근 팀 흐름 15%, 라인업/결장/기타 10%다.
 - 선발투수 하나만으로 승부를 판단하지 않는다.
@@ -3588,7 +3614,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v14.4 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.6 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
