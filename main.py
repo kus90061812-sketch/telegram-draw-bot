@@ -1,3 +1,4 @@
+import psycopg2
 import os
 import re
 import time
@@ -247,6 +248,15 @@ def settle_finished_picks(conn):
 # =========================
 # MAIN
 # =========================
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+def db():
+    """Open Railway PostgreSQL connection."""
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+    return psycopg2.connect(DATABASE_URL)
+
+
 def main():
     conn = db()
 
@@ -258,7 +268,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.1 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
