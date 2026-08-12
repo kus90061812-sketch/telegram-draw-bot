@@ -250,11 +250,71 @@ def settle_finished_picks(conn):
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+class PgCompatConnection:
+    """Small compatibility wrapper so existing SQLite-style conn.execute()
+    calls work on psycopg2/PostgreSQL."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    @staticmethod
+    def _sql(sql):
+        sql = str(sql)
+
+        # SQLite positional placeholders -> psycopg2 placeholders
+        sql = sql.replace("?", "%s")
+
+        # A few common SQLite spellings used by older builds.
+        sql = re.sub(
+            r"INSERT\s+OR\s+IGNORE\s+INTO",
+            "INSERT INTO",
+            sql,
+            flags=re.I,
+        )
+        return sql
+
+    def execute(self, sql, params=None):
+        cur = self.raw.cursor()
+        sql2 = self._sql(sql)
+        params = tuple(params or ())
+
+        try:
+            cur.execute(sql2, params)
+        except psycopg2.errors.UniqueViolation:
+            # Compatibility for old INSERT OR IGNORE statements.
+            self.raw.rollback()
+            if re.search(r"^\s*INSERT\s+INTO", sql2, re.I):
+                sql3 = sql2.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+                cur = self.raw.cursor()
+                cur.execute(sql3, params)
+            else:
+                raise
+        return cur
+
+    def executemany(self, sql, seq):
+        cur = self.raw.cursor()
+        cur.executemany(self._sql(sql), seq)
+        return cur
+
+    def commit(self):
+        return self.raw.commit()
+
+    def rollback(self):
+        return self.raw.rollback()
+
+    def close(self):
+        return self.raw.close()
+
+    def cursor(self, *args, **kwargs):
+        return self.raw.cursor(*args, **kwargs)
+
+
 def db():
-    """Open Railway PostgreSQL connection."""
+    """Open Railway PostgreSQL connection with SQLite-style execute compatibility."""
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
-    return psycopg2.connect(DATABASE_URL)
+    raw = psycopg2.connect(DATABASE_URL)
+    return PgCompatConnection(raw)
 
 
 def main():
@@ -268,7 +328,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.1 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.3 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
