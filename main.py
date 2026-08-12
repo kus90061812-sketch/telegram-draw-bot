@@ -24,24 +24,13 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "@sportnow0")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
-MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "5"))
-DAILY_POST_LIMIT = int(os.getenv("DAILY_POST_LIMIT", "40"))
 FIRST_RUN_SKIP_EXISTING = os.getenv("FIRST_RUN_SKIP_EXISTING", "true").lower() == "true"
 SUMMARIZE_KOREAN = os.getenv("SUMMARIZE_KOREAN", "true").lower() == "true"
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 ENABLE_NEWS_PICKS = os.getenv("ENABLE_NEWS_PICKS", "true").lower() == "true"
-MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "20"))
-MIN_NEWS_EDGE = int(os.getenv("MIN_NEWS_EDGE", "55"))
-ENFORCE_SCORE_CUTOFF = False
 ENABLE_FREE_TEAM_DATA = os.getenv("ENABLE_FREE_TEAM_DATA", "true").lower() == "true"
 RECENT_GAMES_LOOKBACK = int(os.getenv("RECENT_GAMES_LOOKBACK", "5"))
-MAX_PICKS_PER_GROUP = int(os.getenv("MAX_PICKS_PER_GROUP", "4"))
-MAX_PICKS_MLB = int(os.getenv("MAX_PICKS_MLB", "4"))
-MAX_PICKS_KBO = int(os.getenv("MAX_PICKS_KBO", "4"))
-MAX_PICKS_NPB = int(os.getenv("MAX_PICKS_NPB", "4"))
-MAX_PICKS_SOCCER = int(os.getenv("MAX_PICKS_SOCCER", "4"))
-MAX_PICKS_BASKETBALL = int(os.getenv("MAX_PICKS_BASKETBALL", "4"))
 
 ENABLE_RESULT_POSTS = os.getenv("ENABLE_RESULT_POSTS", "true").lower() == "true"
 POST_NEWS_PUBLICLY = os.getenv("POST_NEWS_PUBLICLY", "false").lower() == "true"
@@ -61,11 +50,16 @@ SPORTRADAR_LANGUAGE = os.getenv("SPORTRADAR_LANGUAGE", "en").strip()
 SPORTRADAR_BASE_URL = os.getenv("SPORTRADAR_BASE_URL", "https://api.sportradar.com").rstrip("/")
 ENABLE_SPORTRADAR_KBO = os.getenv("ENABLE_SPORTRADAR_KBO", "true").lower() == "true"
 
+SR_SCHEDULE_REFRESH_SECONDS = int(os.getenv("SR_SCHEDULE_REFRESH_SECONDS", "1800"))
+SR_LINEUP_RECHECK_SECONDS = int(os.getenv("SR_LINEUP_RECHECK_SECONDS", "600"))
+SR_LINEUP_LOOKAHEAD_MINUTES = int(os.getenv("SR_LINEUP_LOOKAHEAD_MINUTES", "360"))
+SR_REQUEST_SPACING_SECONDS = float(os.getenv("SR_REQUEST_SPACING_SECONDS", "1.25"))
+SR_429_BACKOFF_SECONDS = int(os.getenv("SR_429_BACKOFF_SECONDS", "900"))
+TELEGRAM_POST_INTERVAL_SECONDS = int(os.getenv("TELEGRAM_POST_INTERVAL_SECONDS", "120"))
+
 NPB_YAHOO_BASE = os.getenv("NPB_YAHOO_BASE", "https://baseball.yahoo.co.jp")
 
 ENABLE_COMBO_PICKS = False
-COMBO_MIN_SCORE = int(os.getenv("COMBO_MIN_SCORE", "55"))
-COMBO_MAX_PER_GROUP = int(os.getenv("COMBO_MAX_PER_GROUP", "2"))
 PROMO_URL = os.getenv("PROMO_URL", "https://om-1224.com/?code=usdt")
 PROMO_BUTTON_TEXT = os.getenv("PROMO_BUTTON_TEXT", "🎰 오마카세 바로가기")
 PROMO_CODE = os.getenv("PROMO_CODE", "USDT")
@@ -219,6 +213,42 @@ def db():
         )
     """)
 
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sport_schedule_cache (
+            event_id TEXT PRIMARY KEY,
+            sport TEXT NOT NULL,
+            league TEXT NOT NULL,
+            pick_group TEXT NOT NULL,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            start_utc TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT,
+            home_score INTEGER,
+            away_score INTEGER,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lineup_cache (
+            event_id TEXT PRIMARY KEY,
+            home_lineup TEXT,
+            away_lineup TEXT,
+            source TEXT,
+            confirmed INTEGER NOT NULL DEFAULT 0,
+            checked_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_state (
+            state_key TEXT PRIMARY KEY,
+            state_value TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS combo_pick_logs (
@@ -731,6 +761,7 @@ RSS 설명: {summary}
 # TELEGRAM
 # =========================
 def send_telegram(text, promo_button=False):
+    _telegram_post_spacing()
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHANNEL_ID,
@@ -835,17 +866,9 @@ def run_news_cycle(conn):
         return
 
     daily_count = posts_last_24h(conn)
-    if daily_count >= DAILY_POST_LIMIT:
-        log.info("Daily news limit reached | %d/%d", daily_count, DAILY_POST_LIMIT)
-        return
-
     sent_count = 0
 
     for item in items:
-        if sent_count >= MAX_POSTS_PER_CYCLE:
-            break
-        if daily_count + sent_count >= DAILY_POST_LIMIT:
-            break
 
         fp = fingerprint(item["title"], item["link"])
 
@@ -897,9 +920,11 @@ DOMESTIC_LEAGUES = {
 
 
 def _within_prematch_window(start_utc):
+    """Legacy helper kept for old schedule parsers: future games only, no minute window."""
     now = datetime.now(timezone.utc)
     mins = (start_utc - now).total_seconds() / 60
     return mins > 0, round(mins)
+
 
 def _clean_team_text(x):
     return re.sub(r"\s+", " ", (x or "")).strip()
@@ -1162,6 +1187,363 @@ def fetch_kleague_official_games():
         out[g["event_id"]] = g
     return list(out.values())
 
+
+
+
+_TG_LAST_POST_AT = 0.0
+
+def _telegram_post_spacing():
+    """Serialize public channel posts so simultaneous picks do not collide."""
+    global _TG_LAST_POST_AT
+    now = time.monotonic()
+    wait = TELEGRAM_POST_INTERVAL_SECONDS - (now - _TG_LAST_POST_AT)
+    if _TG_LAST_POST_AT and wait > 0:
+        log.info("Telegram post queue | waiting %.1fs", wait)
+        time.sleep(wait)
+    _TG_LAST_POST_AT = time.monotonic()
+
+
+_SR_LAST_REQUEST_AT = 0.0
+_SR_BACKOFF_UNTIL = 0.0
+
+
+def app_state_get(conn, key, default=""):
+    row = conn.execute(
+        "SELECT state_value FROM app_state WHERE state_key=?",
+        (key,)
+    ).fetchone()
+    return row[0] if row else default
+
+
+def app_state_set(conn, key, value):
+    now = utcnow_iso()
+    if conn.pg:
+        conn.execute(
+            """INSERT INTO app_state (state_key,state_value,updated_at)
+               VALUES (?,?,?)
+               ON CONFLICT (state_key)
+               DO UPDATE SET state_value=EXCLUDED.state_value,
+                             updated_at=EXCLUDED.updated_at""",
+            (key, str(value), now),
+        )
+    else:
+        conn.execute(
+            """INSERT OR REPLACE INTO app_state
+               (state_key,state_value,updated_at)
+               VALUES (?,?,?)""",
+            (key, str(value), now),
+        )
+    conn.commit()
+
+
+def _sr_get_json(url, params=None, label="Sportradar"):
+    """Single shared Sportradar request path with spacing + 429 backoff."""
+    global _SR_LAST_REQUEST_AT, _SR_BACKOFF_UNTIL
+
+    now_mono = time.monotonic()
+    if now_mono < _SR_BACKOFF_UNTIL:
+        wait = round(_SR_BACKOFF_UNTIL - now_mono)
+        log.warning("%s skipped | Sportradar backoff active | %ss", label, wait)
+        return None
+
+    delta = now_mono - _SR_LAST_REQUEST_AT
+    if delta < SR_REQUEST_SPACING_SECONDS:
+        time.sleep(SR_REQUEST_SPACING_SECONDS - delta)
+
+    try:
+        r = requests.get(url, params=params, headers=_sportradar_headers(), timeout=20)
+        _SR_LAST_REQUEST_AT = time.monotonic()
+
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            try:
+                backoff = max(int(retry_after), SR_429_BACKOFF_SECONDS)
+            except Exception:
+                backoff = SR_429_BACKOFF_SECONDS
+            _SR_BACKOFF_UNTIL = time.monotonic() + backoff
+            log.warning("%s | HTTP 429 Too Many Requests | backoff=%ss", label, backoff)
+            return None
+
+        if r.status_code != 200:
+            log.warning("%s | HTTP %s | %s", label, r.status_code, r.text[:220])
+            return None
+
+        return r.json()
+
+    except Exception:
+        _SR_LAST_REQUEST_AT = time.monotonic()
+        log.exception("%s request failed", label)
+        return None
+
+
+def _parse_int_score(v):
+    try:
+        if v is None or v == "":
+            return None
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def _summary_status_scores(summary):
+    st = summary.get("sport_event_status") or {}
+    status = str(st.get("status") or st.get("match_status") or "").lower()
+    home_score = _parse_int_score(st.get("home_score"))
+    away_score = _parse_int_score(st.get("away_score"))
+    return status, home_score, away_score
+
+
+def _classify_sr_baseball(summary):
+    """Classify one Global Baseball summary into KBO / NPB / MLB."""
+    text = _sr_context_text(summary)
+
+    if "kbo" in text or "korea baseball" in text:
+        league = "KBO"
+        aliases = KBO_SR_ALIASES
+        group = "kbo"
+    elif "npb" in text or "nippon professional" in text or (
+        ("japan" in text or "'jpn'" in text) and "baseball" in text
+    ):
+        league = "NPB"
+        aliases = NPB_SR_ALIASES
+        group = "npb"
+    elif "mlb" in text or "major league baseball" in text or "major league" in text:
+        league = "MLB"
+        aliases = MLB_SR_ALIASES
+        group = "mlb"
+    else:
+        return None
+
+    comps = _sr_event_competitors(summary)
+    home_comp = next((c for c in comps if c.get("qualifier") == "home"), None)
+    away_comp = next((c for c in comps if c.get("qualifier") == "away"), None)
+    if not home_comp or not away_comp:
+        return None
+
+    home_name = next(
+        (code for code in aliases if _sr_team_matches(code, home_comp, league)),
+        None
+    )
+    away_name = next(
+        (code for code in aliases if _sr_team_matches(code, away_comp, league)),
+        None
+    )
+    if not home_name or not away_name:
+        return None
+
+    return league, group, home_name, away_name, home_comp, away_comp
+
+
+def _upsert_schedule_game(conn, game):
+    now = utcnow_iso()
+    vals = (
+        game["event_id"], game["sport"], game["league"], game["pick_group"],
+        game["home"], game["away"], game["start_utc"], game["source"],
+        game.get("status"), game.get("home_score"), game.get("away_score"), now,
+    )
+
+    if conn.pg:
+        conn.execute(
+            """INSERT INTO sport_schedule_cache
+               (event_id,sport,league,pick_group,home_team,away_team,start_utc,
+                source,status,home_score,away_score,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT (event_id)
+               DO UPDATE SET sport=EXCLUDED.sport,
+                             league=EXCLUDED.league,
+                             pick_group=EXCLUDED.pick_group,
+                             home_team=EXCLUDED.home_team,
+                             away_team=EXCLUDED.away_team,
+                             start_utc=EXCLUDED.start_utc,
+                             source=EXCLUDED.source,
+                             status=EXCLUDED.status,
+                             home_score=EXCLUDED.home_score,
+                             away_score=EXCLUDED.away_score,
+                             updated_at=EXCLUDED.updated_at""",
+            vals,
+        )
+    else:
+        conn.execute(
+            """INSERT OR REPLACE INTO sport_schedule_cache
+               (event_id,sport,league,pick_group,home_team,away_team,start_utc,
+                source,status,home_score,away_score,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            vals,
+        )
+
+
+def refresh_baseball_schedule_cache(conn, force=False):
+    """One shared Global Baseball schedule refresh for KBO/NPB/MLB."""
+    last_raw = app_state_get(conn, "sr_baseball_schedule_refresh", "")
+    if not force and last_raw:
+        try:
+            last = datetime.fromisoformat(last_raw)
+            age = (datetime.now(timezone.utc) - last).total_seconds()
+            if age < SR_SCHEDULE_REFRESH_SECONDS:
+                return
+        except Exception:
+            pass
+
+    now = datetime.now(timezone.utc)
+    # Covers Asia date + MLB UTC boundaries without per-league calls.
+    dates = sorted({
+        (now + timedelta(days=d)).strftime("%Y-%m-%d")
+        for d in (-1, 0, 1, 2)
+    })
+
+    found = 0
+    successful_calls = 0
+
+    for date_str in dates:
+        url = (
+            f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
+            f"{SPORTRADAR_LANGUAGE}/schedules/{date_str}/summaries.json"
+        )
+        data = _sr_get_json(url, label=f"Baseball schedule {date_str}")
+        if data is None:
+            continue
+        successful_calls += 1
+
+        for summary in _iter_sr_summaries(data):
+            ev = summary.get("sport_event") or {}
+            eid = ev.get("id")
+            start_raw = ev.get("start_time")
+            if not eid or not start_raw:
+                continue
+
+            classified = _classify_sr_baseball(summary)
+            if not classified:
+                continue
+
+            league, group, home, away, home_comp, away_comp = classified
+
+            try:
+                start = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+            except Exception:
+                continue
+
+            status, hs, aws = _summary_status_scores(summary)
+
+            _upsert_schedule_game(conn, {
+                "event_id": str(eid),
+                "sport": "baseball",
+                "league": league,
+                "pick_group": group,
+                "home": home,
+                "away": away,
+                "start_utc": start.isoformat(),
+                "source": "Sportradar",
+                "status": status,
+                "home_score": hs,
+                "away_score": aws,
+            })
+            found += 1
+
+    if successful_calls:
+        conn.commit()
+        app_state_set(conn, "sr_baseball_schedule_refresh", utcnow_iso())
+        log.info(
+            "Baseball schedule cache refreshed | calls=%d | events=%d",
+            successful_calls, found
+        )
+    else:
+        log.warning("Baseball schedule refresh produced no successful API call")
+
+
+def load_cached_baseball_games(conn):
+    now = utcnow_iso()
+    rows = conn.execute(
+        """SELECT event_id,league,pick_group,home_team,away_team,start_utc,source
+           FROM sport_schedule_cache
+           WHERE sport='baseball'
+             AND start_utc > ?
+           ORDER BY start_utc ASC""",
+        (now,),
+    ).fetchall()
+
+    out = []
+    current = datetime.now(timezone.utc)
+    for eid, league, group, home, away, start_utc, source in rows:
+        try:
+            start = datetime.fromisoformat(start_utc)
+            mins = round((start - current).total_seconds() / 60)
+        except Exception:
+            mins = 0
+
+        out.append({
+            "event_id": eid,
+            "sportradar_event_id": eid,
+            "sport": "baseball",
+            "league": league,
+            "pick_group": group,
+            "home": home,
+            "away": away,
+            "start_utc": start_utc,
+            "minutes_to_start": mins,
+            "source": source,
+        })
+    return out
+
+
+def _lineup_cache_get(conn, event_id):
+    row = conn.execute(
+        """SELECT home_lineup,away_lineup,source,confirmed,checked_at
+           FROM lineup_cache WHERE event_id=?""",
+        (event_id,),
+    ).fetchone()
+    if not row:
+        return None
+
+    home_raw, away_raw, source, confirmed, checked_at = row
+    try:
+        home = json.loads(home_raw or "[]")
+    except Exception:
+        home = []
+    try:
+        away = json.loads(away_raw or "[]")
+    except Exception:
+        away = []
+
+    return {
+        "home": home,
+        "away": away,
+        "source": source or "",
+        "confirmed": bool(confirmed),
+        "checked_at": checked_at,
+    }
+
+
+def _lineup_cache_set(conn, event_id, info):
+    now = utcnow_iso()
+    vals = (
+        event_id,
+        json.dumps(info.get("home") or [], ensure_ascii=False),
+        json.dumps(info.get("away") or [], ensure_ascii=False),
+        info.get("source") or "",
+        1 if info.get("confirmed") else 0,
+        now,
+    )
+    if conn.pg:
+        conn.execute(
+            """INSERT INTO lineup_cache
+               (event_id,home_lineup,away_lineup,source,confirmed,checked_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT (event_id)
+               DO UPDATE SET home_lineup=EXCLUDED.home_lineup,
+                             away_lineup=EXCLUDED.away_lineup,
+                             source=EXCLUDED.source,
+                             confirmed=EXCLUDED.confirmed,
+                             checked_at=EXCLUDED.checked_at""",
+            vals,
+        )
+    else:
+        conn.execute(
+            """INSERT OR REPLACE INTO lineup_cache
+               (event_id,home_lineup,away_lineup,source,confirmed,checked_at)
+               VALUES (?,?,?,?,?,?)""",
+            vals,
+        )
+    conn.commit()
 
 
 def _looks_like_mlb_summary(summary):
@@ -1451,26 +1833,28 @@ def fetch_domestic_official_games():
     return games
 
 
-def fetch_major_upcoming_games():
+def fetch_major_upcoming_games(conn):
     now = datetime.now(timezone.utc)
 
-    # Domestic KBO/NPB + football, etc.
-    games = fetch_domestic_official_games()
+    # Baseball: one shared Sportradar cache for KBO / NPB / MLB.
+    refresh_baseball_schedule_cache(conn)
+    games = load_cached_baseball_games(conn)
 
-    # v13.3.11: MLB schedule is Sportradar-first so its event_id can be used
-    # directly by the Sport Event Lineups endpoint.
-    mlb_games = fetch_sportradar_mlb_upcoming_games()
-    games.extend(mlb_games)
+    # K League official source remains separate.
+    try:
+        games.extend(fetch_kleague_official_games())
+    except Exception:
+        log.exception("K League schedule fetch failed")
 
+    # Other major sports remain on ESPN.
     date_keys = {
         (now + timedelta(days=d)).strftime("%Y%m%d")
         for d in (-1, 0, 1, 2)
     }
 
     for sport, league, league_name, pick_group in MAJOR_LEAGUES:
-        # Do not fetch MLB from ESPN when Sportradar schedule is available.
-        # It previously caused ESPN event IDs to be sent to Sportradar lineups.
-        if league_name == "MLB" and mlb_games:
+        # MLB is already handled by Sportradar cache.
+        if league_name == "MLB":
             continue
 
         for date_key in date_keys:
@@ -1482,7 +1866,6 @@ def fetch_major_upcoming_games():
                     continue
 
                 data = r.json()
-
                 for ev in data.get("events", []):
                     comps = ev.get("competitions") or []
                     if not comps:
@@ -1498,12 +1881,9 @@ def fetch_major_upcoming_games():
                         continue
 
                     start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
-
-                    # No minute window, but this is PREMATCH: started games are excluded.
                     if start <= now:
                         continue
 
-                    mins = (start - now).total_seconds() / 60
                     competitors = comp.get("competitors") or []
                     if len(competitors) < 2:
                         continue
@@ -1513,13 +1893,11 @@ def fetch_major_upcoming_games():
                         t = c.get("team") or {}
                         teams.append({
                             "name": t.get("displayName") or t.get("shortDisplayName") or t.get("name") or "",
-                            "abbr": t.get("abbreviation") or "",
                             "homeAway": c.get("homeAway") or "",
                         })
 
                     home = next((x for x in teams if x["homeAway"] == "home"), None)
                     away = next((x for x in teams if x["homeAway"] == "away"), None)
-
                     if not home or not away or not home["name"] or not away["name"]:
                         continue
 
@@ -1531,7 +1909,8 @@ def fetch_major_upcoming_games():
                         "home": home["name"],
                         "away": away["name"],
                         "start_utc": start.isoformat(),
-                        "minutes_to_start": round(mins),
+                        "minutes_to_start": round((start-now).total_seconds()/60),
+                        "source": "ESPN",
                     })
 
             except Exception:
@@ -1539,9 +1918,8 @@ def fetch_major_upcoming_games():
 
     unique = {}
     for g in games:
-        key = g["event_id"] or f'{g["league"]}|{g["home"]}|{g["away"]}|{g["start_utc"]}'
+        key = g.get("event_id") or f'{g["league"]}|{g["home"]}|{g["away"]}|{g["start_utc"]}'
         unique[key] = g
-
     return list(unique.values())
 
 
@@ -1964,135 +2342,75 @@ def _sr_starters(competitor):
     return starters
 
 def fetch_sportradar_baseball_lineup(game):
-    """Parse Global Baseball Sport Event Lineups using starter=true."""
+    """Global Baseball lineups. Shared rate-limited request path."""
     league = str(game.get("league") or "").upper()
-    event_id = str(
-        game.get("sportradar_event_id")
-        or game.get("event_id")
-        or ""
-    )
-
+    event_id = str(game.get("sportradar_event_id") or game.get("event_id") or "")
     if not event_id:
-        log.info("Sportradar %s lineup skipped | event_id missing", league or "BASEBALL")
         return {"home": [], "away": [], "source": ""}
 
     url = (
         f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
         f"{SPORTRADAR_LANGUAGE}/sport_events/{event_id}/lineups.json"
     )
+    data = _sr_get_json(url, label=f"{league} lineup {event_id}")
+    if data is None:
+        return {"home": [], "away": [], "source": ""}
 
     try:
-        r = requests.get(url, headers=_sportradar_headers(), timeout=20)
-
-        if r.status_code != 200:
-            log.warning(
-                "Sportradar %s lineups HTTP %s | event=%s | body=%s",
-                league, r.status_code, event_id, r.text[:250]
-            )
-            return {"home": [], "away": [], "source": ""}
-
-        data = r.json()
-
-        log.info(
-            "Sportradar %s lineups response | event=%s | keys=%s",
-            league, event_id, list(data.keys())
-        )
-
         node = data.get("lineups")
         competitors = []
-
         if isinstance(node, dict):
             competitors = node.get("competitors") or node.get("competitor") or []
         elif isinstance(node, list):
             competitors = node
-
         if not competitors:
             competitors = data.get("competitors") or []
-
         if isinstance(competitors, dict):
             competitors = competitors.get("competitor") or list(competitors.values())
 
         home_all = []
         away_all = []
-        home_starters = []
-        away_starters = []
+        home = []
+        away = []
 
         for comp in competitors or []:
             if not isinstance(comp, dict):
                 continue
-
-            qualifier = str(comp.get("qualifier") or "").lower()
+            q = str(comp.get("qualifier") or "").lower()
             players = comp.get("players") or []
-
             if isinstance(players, dict):
                 players = players.get("player") or list(players.values())
-
             players = [x for x in players if isinstance(x, dict)]
             starters = [x for x in players if x.get("starter") is True]
+            starters.sort(key=lambda x: (x.get("order") is None, x.get("order", 999)))
 
-            starters.sort(
-                key=lambda x: (
-                    x.get("order") is None,
-                    x.get("order", 999)
-                )
-            )
-
-            if qualifier == "home":
-                home_all = players
-                home_starters = starters
-            elif qualifier == "away":
-                away_all = players
-                away_starters = starters
-
-        coverage = (
-            (data.get("sport_event") or {}).get("coverage")
-            or data.get("coverage")
-            or {}
-        )
+            if q == "home":
+                home_all, home = players, starters
+            elif q == "away":
+                away_all, away = players, starters
 
         log.info(
             "Sportradar %s lineup parsed | event=%s | competitors=%d | "
-            "home_players=%d away_players=%d | home_starters=%d away_starters=%d | coverage=%s",
+            "home_players=%d away_players=%d | home_starters=%d away_starters=%d",
             league, event_id, len(competitors or []),
-            len(home_all), len(away_all),
-            len(home_starters), len(away_starters),
-            str(coverage)[:250]
+            len(home_all), len(away_all), len(home), len(away)
         )
 
-        if not home_starters or not away_starters:
-            log.info(
-                "Sportradar %s lineup unavailable | event=%s | home=%d away=%d | lineups_type=%s",
-                league, event_id, len(home_starters), len(away_starters),
-                type(node).__name__
-            )
-            return {"home": [], "away": [], "source": ""}
-
-        def player_names(players):
-            names = []
-            for x in players:
-                name = str(x.get("name") or "").strip()
-                if name:
-                    names.append(name)
-            return names
-
-        home_names = player_names(home_starters)
-        away_names = player_names(away_starters)
-
-        game["home_lineup_detail"] = home_starters
-        game["away_lineup_detail"] = away_starters
-        game["lineup_source"] = "Sportradar"
+        def names(players):
+            return [
+                str(x.get("name") or "").strip()
+                for x in players
+                if str(x.get("name") or "").strip()
+            ]
 
         return {
-            "home": home_names,
-            "away": away_names,
+            "home": names(home),
+            "away": names(away),
             "source": "Sportradar",
         }
 
     except Exception:
-        log.exception(
-            "Sportradar %s lineup fetch/parse failed | event=%s",
-            league, event_id
-        )
+        log.exception("Sportradar %s lineup parse failed | event=%s", league, event_id)
         return {"home": [], "away": [], "source": ""}
 
 
@@ -2295,40 +2613,67 @@ def fetch_npb_yahoo_lineup(game):
         log.exception("NPB SportsNavi lineup fetch failed")
         return {"home": [], "away": [], "source": ""}
 
-def enrich_asia_lineup(game):
+def enrich_asia_lineup(game, conn=None):
     league = game.get("league")
+    if league not in ("KBO", "NPB", "MLB"):
+        return game
 
-    if league == "KBO":
-        # 1순위 Sportradar
-        info = fetch_sportradar_baseball_lineup(game)
-        # fallback 네이버
-        if not info.get("home") or not info.get("away"):
-            info = fetch_kbo_naver_mobile_lineup(game)
+    event_id = str(game.get("sportradar_event_id") or game.get("event_id") or "")
+
+    # 1) confirmed DB cache = zero API calls forever for this event
+    if conn and event_id:
+        cached = _lineup_cache_get(conn, event_id)
+        if cached and cached.get("confirmed"):
+            game["home_lineup"] = cached["home"]
+            game["away_lineup"] = cached["away"]
+            game["lineup_source"] = cached["source"]
+            return game
+
+        # Unconfirmed cache: don't hammer the API every cycle.
+        if cached and cached.get("checked_at"):
+            try:
+                checked = datetime.fromisoformat(cached["checked_at"])
+                age = (datetime.now(timezone.utc) - checked).total_seconds()
+                if age < SR_LINEUP_RECHECK_SECONDS:
+                    return game
+            except Exception:
+                pass
+
+    # 2) Don't waste lineup calls on very distant games.
+    # This is NOT a pick time window: the game stays cached/candidate.
+    try:
+        start = datetime.fromisoformat(game["start_utc"])
+        mins = (start - datetime.now(timezone.utc)).total_seconds() / 60
+        if mins > SR_LINEUP_LOOKAHEAD_MINUTES:
+            return game
+        if mins <= 0:
+            return game
+    except Exception:
+        pass
+
+    info = fetch_sportradar_baseball_lineup(game)
+
+    # League-specific fallback only after Sportradar.
+    if (not info.get("home") or not info.get("away")) and league == "KBO":
+        info = fetch_kbo_naver_mobile_lineup(game)
         if not info.get("home") or not info.get("away"):
             info = fetch_kbo_naver_lineup(game)
 
-    elif league == "NPB":
-        # 1순위 Sportradar
-        info = fetch_sportradar_baseball_lineup(game)
-        # fallback SportsNavi
-        if not info.get("home") or not info.get("away"):
-            info = fetch_npb_yahoo_lineup(game)
+    elif (not info.get("home") or not info.get("away")) and league == "NPB":
+        info = fetch_npb_yahoo_lineup(game)
 
-    elif league == "MLB":
-        # Ensure we never send an ESPN event_id to Sportradar lineups.
-        if not game.get("sportradar_event_id"):
-            sr_event_id = fetch_sportradar_baseball_event_id(game)
-            if sr_event_id:
-                game["sportradar_event_id"] = sr_event_id
+    confirmed = (
+        len(info.get("home") or []) >= LINEUP_MIN_PLAYERS
+        and len(info.get("away") or []) >= LINEUP_MIN_PLAYERS
+    )
 
-        info = fetch_sportradar_baseball_lineup(game)
-
-        # ESPN remains fallback only when Sportradar has no usable lineup.
-        if not info.get("home") or not info.get("away"):
-            return game
-
-    else:
-        return game
+    if conn and event_id:
+        _lineup_cache_set(conn, event_id, {
+            "home": info.get("home") or [],
+            "away": info.get("away") or [],
+            "source": info.get("source") or "",
+            "confirmed": confirmed,
+        })
 
     if info.get("home"):
         game["home_lineup"] = info["home"]
@@ -2336,6 +2681,7 @@ def enrich_asia_lineup(game):
         game["away_lineup"] = info["away"]
     if info.get("source"):
         game["lineup_source"] = info["source"]
+
     return game
 
 
@@ -2419,12 +2765,12 @@ def baseball_model_score(game, news_items):
     }
 
 
-def select_prematch_top_picks(games, news_items):
+def select_prematch_top_picks(games, news_items, conn=None):
     if REQUIRE_CONFIRMED_LINEUP:
         kept=[]
         for g in games:
             if g.get("league") in ("KBO", "NPB", "MLB"):
-                g = enrich_asia_lineup(g)
+                g = enrich_asia_lineup(g, conn)
 
             baseball = g.get("sport")=="baseball" or g.get("league") in ("KBO","NPB","MLB")
             if not baseball:
@@ -2830,12 +3176,12 @@ def maybe_post_prematch_picks(conn):
         return
 
     games = [
-        g for g in fetch_major_upcoming_games()
+        g for g in fetch_major_upcoming_games(conn)
         if not event_pick_exists(conn, g["event_id"])
     ]
 
     if not games:
-        log.info("No eligible upcoming major games")
+        log.info("No eligible upcoming games")
         return
 
     news_items = recent_news_for_picks(conn, 48, 100)
@@ -2843,7 +3189,7 @@ def maybe_post_prematch_picks(conn):
         log.info("Limited cached news | count=%d | continuing with game/lineup data", len(news_items))
 
     try:
-        picks = select_prematch_top_picks(games, news_items)
+        picks = select_prematch_top_picks(games, news_items, conn)
     except Exception:
         log.exception("Prematch AI analysis failed")
         return
@@ -2917,6 +3263,43 @@ LEAGUE_ENDPOINTS = {
     "NFL": ("football", "nfl"),
     "NHL": ("hockey", "nhl"),
 }
+
+
+
+def fetch_cached_baseball_result(conn, event_id):
+    # Refresh may also update scores/status, but TTL prevents hammering.
+    refresh_baseball_schedule_cache(conn)
+
+    row = conn.execute(
+        """SELECT league,home_team,away_team,status,home_score,away_score
+           FROM sport_schedule_cache WHERE event_id=?""",
+        (event_id,),
+    ).fetchone()
+    if not row:
+        return None
+
+    league, home, away, status, hs, aws = row
+    status = str(status or "").lower()
+
+    completed = status in (
+        "closed", "ended", "finished", "complete", "completed", "after_penalties"
+    )
+    if not completed or hs is None or aws is None:
+        return None
+
+    winner = ""
+    if hs > aws:
+        winner = home
+    elif aws > hs:
+        winner = away
+
+    return {
+        "home_team": home,
+        "away_team": away,
+        "home_score": int(hs),
+        "away_score": int(aws),
+        "winner_team": winner,
+    }
 
 
 def fetch_event_result(event_id, league_name):
@@ -3081,12 +3464,12 @@ def settle_finished_picks(conn):
     for row in rows:
         event_id, league, home_team, away_team, pick_team, probability = row
 
-        # 해외 메이저는 ESPN summary로 자동 결과판정.
-        # KBO/NPB/K리그 공식 결과 파서는 다음 단계에서 별도 확장 가능.
-        if league in ("KBO", "NPB", "K League 1", "KBL"):
+        if league in ("KBO", "NPB", "MLB"):
+            result = fetch_cached_baseball_result(conn, event_id)
+        elif league in ("K League 1", "KBL"):
             continue
-
-        result = fetch_event_result(event_id, league)
+        else:
+            result = fetch_event_result(event_id, league)
         if not result:
             continue
 
@@ -3145,7 +3528,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.11 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.2 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
