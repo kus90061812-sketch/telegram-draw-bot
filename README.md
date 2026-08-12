@@ -1,17 +1,22 @@
-# SPORT NOW v14.3 — Minimal Sportradar Calls
+# SPORT NOW v14.4 — Schedule Fallback
 
-변경:
-- 야구 일정 조회를 과거/미래 4일 조회에서 최소 1~2일 조회로 변경
-- KST 오늘 날짜 조회
-- UTC 날짜가 KST와 다를 때만 UTC 오늘 날짜 추가 조회 (MLB 날짜 경계 보완)
-- 내일 일정 선조회 제거
-- Railway 로그에 실제 조회 날짜 표시
+핵심:
+- Sportradar 일정 API가 429/장애여도 야구 후보 전체가 0개로 끝나지 않음
+- KBO 캐시 없음 -> 기존 KBO 공식 일정 fallback
+- NPB 캐시 없음 -> 기존 NPB 공식 일정 fallback
+- MLB 캐시 없음 -> ESPN 일정 fallback
+- fallback event_id를 Sportradar lineups endpoint에 잘못 넣지 않음
+- Sportradar가 다시 정상화되면 캐시 데이터 우선 사용
 
 유지:
-- KBO / NPB / MLB 공통 일정 캐시
-- 30분 일정 캐시
-- 라인업 캐시 / 재확인
-- Sportradar 요청 간격 / 429 백오프
+- 일정 API 호출 최소화
+- 429 backoff
+- lineup cache
+- Telegram 2분 간격
 - 픽 개수 제한 없음
-- 텔레그램 게시 간격 120초
+- 점수 컷 없음
 - FINAL COMBO 없음
+
+주의:
+REQUIRE_CONFIRMED_LINEUP=true이면 fallback 일정에서 실제 라인업을 확보하지 못한 야구 경기는
+여전히 픽에서 제외됩니다. 이는 가짜 라인업으로 게시하는 것을 막기 위한 정상 동작입니다.

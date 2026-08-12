@@ -1843,9 +1843,30 @@ def fetch_domestic_official_games():
 def fetch_major_upcoming_games(conn):
     now = datetime.now(timezone.utc)
 
-    # Baseball: one shared Sportradar cache for KBO / NPB / MLB.
+    # 1) Try shared Sportradar cache first.
     refresh_baseball_schedule_cache(conn)
     games = load_cached_baseball_games(conn)
+
+    cached_leagues = {g.get("league") for g in games if g.get("sport") == "baseball"}
+
+    # 2) Sportradar unavailable/429/no cache -> league-specific schedule fallback.
+    if "KBO" not in cached_leagues:
+        try:
+            kbo_fb = fetch_kbo_official_games()
+            if kbo_fb:
+                log.warning("KBO schedule fallback active | games=%d", len(kbo_fb))
+                games.extend(kbo_fb)
+        except Exception:
+            log.exception("KBO schedule fallback failed")
+
+    if "NPB" not in cached_leagues:
+        try:
+            npb_fb = fetch_npb_official_games()
+            if npb_fb:
+                log.warning("NPB schedule fallback active | games=%d", len(npb_fb))
+                games.extend(npb_fb)
+        except Exception:
+            log.exception("NPB schedule fallback failed")
 
     # K League official source remains separate.
     try:
@@ -1853,15 +1874,15 @@ def fetch_major_upcoming_games(conn):
     except Exception:
         log.exception("K League schedule fetch failed")
 
-    # Other major sports remain on ESPN.
+    # 3) ESPN handles non-baseball major sports and MLB schedule fallback.
     date_keys = {
         (now + timedelta(days=d)).strftime("%Y%m%d")
-        for d in (-1, 0, 1, 2)
+        for d in (-1, 0, 1)
     }
 
     for sport, league, league_name, pick_group in MAJOR_LEAGUES:
-        # MLB is already handled by Sportradar cache.
-        if league_name == "MLB":
+        # If MLB is already in Sportradar cache, don't duplicate it from ESPN.
+        if league_name == "MLB" and "MLB" in cached_leagues:
             continue
 
         for date_key in date_keys:
@@ -1873,6 +1894,7 @@ def fetch_major_upcoming_games(conn):
                     continue
 
                 data = r.json()
+
                 for ev in data.get("events", []):
                     comps = ev.get("competitions") or []
                     if not comps:
@@ -1900,7 +1922,9 @@ def fetch_major_upcoming_games(conn):
                         t = c.get("team") or {}
                         teams.append({
                             "name": t.get("displayName") or t.get("shortDisplayName") or t.get("name") or "",
+                            "abbr": t.get("abbreviation") or "",
                             "homeAway": c.get("homeAway") or "",
+                            "raw": c,
                         })
 
                     home = next((x for x in teams if x["homeAway"] == "home"), None)
@@ -1908,7 +1932,7 @@ def fetch_major_upcoming_games(conn):
                     if not home or not away or not home["name"] or not away["name"]:
                         continue
 
-                    games.append({
+                    game = {
                         "event_id": str(ev.get("id", "")),
                         "sport": sport,
                         "league": league_name,
@@ -1918,16 +1942,41 @@ def fetch_major_upcoming_games(conn):
                         "start_utc": start.isoformat(),
                         "minutes_to_start": round((start-now).total_seconds()/60),
                         "source": "ESPN",
-                    })
+                        "home_competitor": home["raw"],
+                        "away_competitor": away["raw"],
+                    }
+
+                    if league_name == "MLB":
+                        log.warning(
+                            "MLB schedule fallback active | %s vs %s | start=%s",
+                            away["name"], home["name"], start.isoformat()
+                        )
+
+                    games.append(game)
 
             except Exception:
                 log.exception("Schedule fetch failed | %s %s", sport, league)
 
+    # Deduplicate by league/home/away/start when source IDs differ.
     unique = {}
     for g in games:
-        key = g.get("event_id") or f'{g["league"]}|{g["home"]}|{g["away"]}|{g["start_utc"]}'
-        unique[key] = g
-    return list(unique.values())
+        key = (
+            g.get("league"),
+            str(g.get("home") or "").lower(),
+            str(g.get("away") or "").lower(),
+            str(g.get("start_utc") or "")[:16],
+        )
+        # Prefer Sportradar copy over fallback source for same game.
+        if key not in unique or g.get("source") == "Sportradar":
+            unique[key] = g
+
+    result = list(unique.values())
+    log.info(
+        "Upcoming candidates | total=%d | baseball=%d",
+        len(result),
+        sum(1 for g in result if g.get("sport") == "baseball")
+    )
+    return result
 
 
 def recent_news_for_picks(conn, hours=48, limit=100):
@@ -2658,7 +2707,11 @@ def enrich_asia_lineup(game, conn=None):
     except Exception:
         pass
 
-    info = fetch_sportradar_baseball_lineup(game)
+    # Only call Sportradar lineups when this game has a real Sportradar event id.
+    if game.get("source") == "Sportradar" or game.get("sportradar_event_id"):
+        info = fetch_sportradar_baseball_lineup(game)
+    else:
+        info = {"home": [], "away": [], "source": ""}
 
     # League-specific fallback only after Sportradar.
     if (not info.get("home") or not info.get("away")) and league == "KBO":
@@ -3535,7 +3588,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v14.3 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.4 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
