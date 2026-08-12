@@ -1164,6 +1164,85 @@ def fetch_kleague_official_games():
     return list(out.values())
 
 
+def fetch_sportradar_kbo_upcoming_games():
+    """KBO 일정 자체를 Sportradar Daily Summaries에서 생성한다."""
+    if not SPORTRADAR_API_KEY:
+        log.info("KBO Sportradar schedule skipped | API key missing")
+        return []
+
+    now_utc = datetime.now(timezone.utc)
+    now_jst = now_utc.astimezone(timezone(timedelta(hours=9)))
+    date_keys = {
+        now_jst.strftime("%Y-%m-%d"),
+        (now_jst + timedelta(days=1)).strftime("%Y-%m-%d"),
+    }
+    out = {}
+
+    try:
+        for date_str in sorted(date_keys):
+            url = (
+                f"{SPORTRADAR_BASE_URL}/baseball/{SPORTRADAR_ACCESS_LEVEL}/v2/"
+                f"{SPORTRADAR_LANGUAGE}/schedules/{date_str}/summaries.json"
+            )
+            r = requests.get(url, headers=_sportradar_headers(), timeout=20)
+            if r.status_code != 200:
+                log.warning("KBO Sportradar schedule failed | %s | HTTP %s | %s",
+                            date_str, r.status_code, r.text[:160])
+                continue
+
+            for summary in _iter_sr_summaries(r.json()):
+                ev = summary.get("sport_event") or {}
+                eid = ev.get("id")
+                comps = _sr_event_competitors(summary)
+                if not eid or len(comps) < 2:
+                    continue
+
+                hc = next((c for c in comps if c.get("qualifier") == "home"), None)
+                ac = next((c for c in comps if c.get("qualifier") == "away"), None)
+                if not hc or not ac:
+                    continue
+
+                home_code = next((code for code in KBO_SR_ALIASES if _sr_team_matches(code, hc, "KBO")), None)
+                away_code = next((code for code in KBO_SR_ALIASES if _sr_team_matches(code, ac, "KBO")), None)
+                if not home_code or not away_code:
+                    continue
+
+                start_raw = ev.get("start_time")
+                if not start_raw:
+                    continue
+                try:
+                    start_utc = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+
+                mins = (start_utc - now_utc).total_seconds() / 60
+                if not (PREMATCH_MIN_MINUTES <= mins <= PREMATCH_MAX_MINUTES):
+                    continue
+
+                out[eid] = {
+                    "event_id": eid,
+                    "sport": "baseball",
+                    "league": "KBO",
+                    "pick_group": "kbo",
+                    "home": home_code,
+                    "away": away_code,
+                    "start_utc": start_utc.isoformat(),
+                    "minutes_to_start": round(mins),
+                    "source": "Sportradar",
+                    "sportradar_event_id": eid,
+                    "sportradar_home_id": hc.get("id", ""),
+                    "sportradar_away_id": ac.get("id", ""),
+                    "sportradar_home_name": hc.get("name", ""),
+                    "sportradar_away_name": ac.get("name", ""),
+                }
+
+        log.info("KBO Sportradar schedule candidates | count=%d", len(out))
+    except Exception:
+        log.exception("KBO Sportradar schedule fetch failed")
+
+    return list(out.values())
+
+
 def fetch_sportradar_npb_upcoming_games():
     """NPB 일정 자체를 Sportradar Daily Summaries에서 생성한다."""
     if not SPORTRADAR_API_KEY:
@@ -1244,13 +1323,21 @@ def fetch_sportradar_npb_upcoming_games():
 
 def fetch_domestic_official_games():
     games = []
-    games.extend(fetch_kbo_official_games())
 
-    # NPB는 일정부터 Sportradar를 1순위로 사용.
+    # KBO: Sportradar schedule first, old source only as fallback.
+    kbo_games = fetch_sportradar_kbo_upcoming_games()
+    if kbo_games:
+        games.extend(kbo_games)
+    else:
+        log.info("KBO Sportradar returned no candidate | fallback=official")
+        games.extend(fetch_kbo_official_games())
+
+    # NPB: Sportradar schedule first.
     npb_games = fetch_sportradar_npb_upcoming_games()
     if npb_games:
         games.extend(npb_games)
     else:
+        log.info("NPB Sportradar returned no candidate | fallback=official")
         games.extend(fetch_npb_official_games())
 
     games.extend(fetch_kleague_official_games())
@@ -2870,7 +2957,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.4 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.5 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
