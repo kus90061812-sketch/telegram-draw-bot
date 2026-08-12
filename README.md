@@ -1,21 +1,18 @@
-# SPORT NOW v13.3.9 — Real Unlimited / No Score Cut
+# SPORT NOW v13.3.10 — No Prematch Time Window
 
-이번 버전에서 실제로 남아 있던 제한을 모두 제거했습니다.
+변경:
+- PREMATCH_MIN_MINUTES 완전 제거
+- PREMATCH_MAX_MINUTES 완전 제거
+- 경기 시작 몇 분 전인지로 후보를 제외하지 않음
+- 아직 시작하지 않은 경기라면 후보로 유지
+- 라인업/경기 데이터가 확보되고 분석 가능하면 게시
 
-제거:
-- AI 프롬프트의 55점 미만 제외 문구
-- Python의 MIN_NEWS_EDGE 점수 필터
-- AI 응답 data[:4] 4개 제한
-- 그룹별 max_picks 제한
-- 뉴스 3개 미만이면 전체 분석 중단하는 조건
-- source_ids가 없으면 픽을 버리는 조건
-
-유지:
-- 라인업 확인
-- 경기 데이터 기반 분석
-- PRIME SCORE는 참고용
+기존 유지:
 - 픽 개수 제한 없음
+- PRIME SCORE/55점 컷 없음
 - FINAL COMBO 없음
-- 중복 경기 게시 방지
 - KBO/NPB Sportradar 일정
-- KBO/NPB/MLB Sportradar 라인업
+- KBO/NPB/MLB 라인업
+- 동일 경기 중복 게시 방지
+
+Railway에서 PREMATCH_MIN_MINUTES / PREMATCH_MAX_MINUTES 변수는 삭제해도 됩니다.

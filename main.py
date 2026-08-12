@@ -31,8 +31,6 @@ SUMMARIZE_KOREAN = os.getenv("SUMMARIZE_KOREAN", "true").lower() == "true"
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
 ENABLE_NEWS_PICKS = os.getenv("ENABLE_NEWS_PICKS", "true").lower() == "true"
-PREMATCH_MIN_MINUTES = int(os.getenv("PREMATCH_MIN_MINUTES", "45"))
-PREMATCH_MAX_MINUTES = int(os.getenv("PREMATCH_MAX_MINUTES", "70"))
 MAX_PICKS_PER_DAY = int(os.getenv("MAX_PICKS_PER_DAY", "20"))
 MIN_NEWS_EDGE = int(os.getenv("MIN_NEWS_EDGE", "55"))
 ENFORCE_SCORE_CUTOFF = False
@@ -901,7 +899,7 @@ DOMESTIC_LEAGUES = {
 def _within_prematch_window(start_utc):
     now = datetime.now(timezone.utc)
     mins = (start_utc - now).total_seconds() / 60
-    return PREMATCH_MIN_MINUTES <= mins <= PREMATCH_MAX_MINUTES, round(mins)
+    return mins > 0, round(mins)
 
 def _clean_team_text(x):
     return re.sub(r"\s+", " ", (x or "")).strip()
@@ -1217,9 +1215,6 @@ def fetch_sportradar_kbo_upcoming_games():
                     continue
 
                 mins = (start_utc - now_utc).total_seconds() / 60
-                if not (PREMATCH_MIN_MINUTES <= mins <= PREMATCH_MAX_MINUTES):
-                    continue
-
                 out[eid] = {
                     "event_id": eid,
                     "sport": "baseball",
@@ -1296,9 +1291,6 @@ def fetch_sportradar_npb_upcoming_games():
                     continue
 
                 mins = (start_utc - now_utc).total_seconds() / 60
-                if not (PREMATCH_MIN_MINUTES <= mins <= PREMATCH_MAX_MINUTES):
-                    continue
-
                 out[eid] = {
                     "event_id": eid,
                     "sport": "baseball",
@@ -1380,10 +1372,6 @@ def fetch_major_upcoming_games():
 
                     start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
                     mins = (start - now).total_seconds() / 60
-
-                    if mins < PREMATCH_MIN_MINUTES or mins > PREMATCH_MAX_MINUTES:
-                        continue
-
                     competitors = comp.get("competitors") or []
                     if len(competitors) < 2:
                         continue
@@ -2710,7 +2698,7 @@ def maybe_post_prematch_picks(conn):
     ]
 
     if not games:
-        log.info("No eligible major games in prematch window")
+        log.info("No eligible upcoming major games")
         return
 
     news_items = recent_news_for_picks(conn, 48, 100)
@@ -3020,7 +3008,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v13.3.9 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v13.3.10 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
