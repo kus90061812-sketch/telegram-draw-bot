@@ -1,3 +1,8 @@
+# SPORT NOW v14.7.1 HOTFIX
+
+- v14.7 resolver의 `_norm_team` NameError 수정 (`norm_team` 사용)
+- Sportradar 공식 lineups 파서/429 backoff/30분 deadline 로직은 그대로 유지
+
 # SPORT NOW v14.7 — Sportradar Official Lineups
 
 공식 Sportradar Global Baseball v2 문서 기준으로 재정비.

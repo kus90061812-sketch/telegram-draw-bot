@@ -2734,8 +2734,8 @@ def resolve_cached_sportradar_event_id(conn, game):
         return ""
 
     league = str(game.get("league") or "")
-    home = _norm_team(game.get("home") or "")
-    away = _norm_team(game.get("away") or "")
+    home = norm_team(game.get("home") or "")
+    away = norm_team(game.get("away") or "")
 
     try:
         target_start = datetime.fromisoformat(str(game.get("start_utc") or "").replace("Z", "+00:00"))
@@ -2753,8 +2753,8 @@ def resolve_cached_sportradar_event_id(conn, game):
     best_delta = 10**9
 
     for eid, chome, caway, cstart in rows:
-        nh = _norm_team(chome or "")
-        na = _norm_team(caway or "")
+        nh = norm_team(chome or "")
+        na = norm_team(caway or "")
 
         # exact normalized names or contained aliases
         home_ok = nh == home or nh in home or home in nh
@@ -3736,7 +3736,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v14.7 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.7.1 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
