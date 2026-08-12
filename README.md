@@ -1,22 +1,28 @@
-# SPORT NOW v13.3.3 — PostgreSQL compatibility fix
+# SPORT NOW v13.3.4 — Clean Rebuild
 
-Fix:
-- psycopg2 connection now wrapped with `PgCompatConnection`
-- existing `conn.execute(...).fetchone()/fetchall()` calls can run
-- SQLite `?` placeholders are converted to PostgreSQL `%s`
-- common SQLite schema syntax is converted for PostgreSQL
-- `psycopg2-binary` remains in requirements.txt
+정상 v13.2 원본에서 다시 빌드했습니다.
 
-Existing behavior retained:
-- unlimited picks
-- FINAL COMBO removed
-- Sportradar baseball integrations
-- OpenAI / Telegram logic
+변경:
+- 픽 개수 제한 없음
+- KBO / NPB / MLB / 축구 / 농구 모두 55점 이상 기준 충족 시 개수 제한 없이 게시
+- FINAL COMBO 게시 제거
+- 동일 event_id 중복 방지는 유지
+- NPB Sportradar 일정 수집 유지
+- KBO/NPB/MLB Sportradar 라인업 유지
+- PostgreSQL 기존 DB 클래스/psycopg(v3) 구조 그대로 유지
 
-Static scan:
-- INSERT OR REPLACE occurrences before patch: 0
-- remaining SQLite-specific patterns: none detected
+중요:
+이 버전은 psycopg2를 새로 쓰지 않습니다.
+기존 requirements.txt의 psycopg 구조를 그대로 사용합니다.
 
-Railway:
-- Keep DATABASE_URL
-- No need to restore MAX_PICKS_* / COMBO_* variables
+Railway에서 삭제 가능:
+MAX_PICKS_KBO
+MAX_PICKS_NPB
+MAX_PICKS_MLB
+MAX_PICKS_SOCCER
+MAX_PICKS_BASKETBALL
+MAX_PICKS_PER_GROUP
+MAX_PICKS_PER_DAY
+ENABLE_COMBO_PICKS
+COMBO_MIN_SCORE
+COMBO_MAX_PER_GROUP
