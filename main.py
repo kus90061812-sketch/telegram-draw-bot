@@ -1384,15 +1384,22 @@ def refresh_baseball_schedule_cache(conn, force=False):
         except Exception:
             pass
 
-    now = datetime.now(timezone.utc)
-    # Covers Asia date + MLB UTC boundaries without per-league calls.
+    now_utc = datetime.now(timezone.utc)
+    now_kst = now_utc + timedelta(hours=9)
+
+    # Minimal schedule calls:
+    # - KST today catches KBO/NPB and today's Korea-facing schedule.
+    # - UTC today is added only when it differs, which catches MLB across the
+    #   Korea/UTC date boundary (e.g. early-morning KST games).
+    # Never prefetch tomorrow just to fill the cache.
     dates = sorted({
-        (now + timedelta(days=d)).strftime("%Y-%m-%d")
-        for d in (-1, 0, 1, 2)
+        now_kst.strftime("%Y-%m-%d"),
+        now_utc.strftime("%Y-%m-%d"),
     })
 
     found = 0
     successful_calls = 0
+    log.info("Baseball schedule refresh dates | %s", ",".join(dates))
 
     for date_str in dates:
         url = (
@@ -3528,7 +3535,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v14.2 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.3 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
