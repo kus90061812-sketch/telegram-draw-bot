@@ -3560,6 +3560,135 @@ def fetch_cached_baseball_result(conn, event_id):
     }
 
 
+
+def fetch_espn_result_by_matchup(league_name, home_team, away_team, start_utc):
+    """Find a completed ESPN event by league + teams + scheduled date.
+
+    Used as a result fallback when the stored event_id is a Sportradar ID
+    or another non-ESPN identifier.
+    """
+    pair = LEAGUE_ENDPOINTS.get(league_name)
+    if not pair:
+        return None
+
+    sport, league = pair
+
+    try:
+        target = datetime.fromisoformat(str(start_utc).replace("Z", "+00:00"))
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+    except Exception:
+        target = datetime.now(timezone.utc)
+
+    # ESPN date keys around the scheduled game date; handles timezone boundaries.
+    date_keys = {
+        (target + timedelta(days=d)).strftime("%Y%m%d")
+        for d in (-1, 0, 1)
+    }
+
+    best = None
+    best_delta = 10**18
+
+    for date_key in sorted(date_keys):
+        url = f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard"
+
+        try:
+            r = requests.get(url, params={"dates": date_key}, timeout=15)
+            if r.status_code != 200:
+                continue
+
+            data = r.json()
+
+            for ev in data.get("events", []):
+                comps = ev.get("competitions") or []
+                if not comps:
+                    continue
+
+                comp = comps[0]
+                status = ((comp.get("status") or {}).get("type") or {})
+                if not status.get("completed"):
+                    continue
+
+                home = None
+                away = None
+
+                for c in comp.get("competitors") or []:
+                    t = c.get("team") or {}
+                    team = (
+                        t.get("displayName")
+                        or t.get("shortDisplayName")
+                        or t.get("name")
+                        or ""
+                    )
+
+                    try:
+                        score = int(float(c.get("score", 0) or 0))
+                    except Exception:
+                        score = 0
+
+                    item = {
+                        "team": team,
+                        "score": score,
+                        "winner": bool(c.get("winner", False)),
+                    }
+
+                    if c.get("homeAway") == "home":
+                        home = item
+                    elif c.get("homeAway") == "away":
+                        away = item
+
+                if not home or not away:
+                    continue
+
+                if not (
+                    same_team(home_team, home["team"])
+                    and same_team(away_team, away["team"])
+                ):
+                    continue
+
+                ev_start_raw = ev.get("date") or comp.get("date")
+                delta = 0
+                if ev_start_raw:
+                    try:
+                        ev_start = datetime.fromisoformat(ev_start_raw.replace("Z", "+00:00"))
+                        delta = abs((ev_start - target).total_seconds())
+                    except Exception:
+                        delta = 999999
+
+                if delta < best_delta:
+                    winner = ""
+                    if home["score"] > away["score"]:
+                        winner = home["team"]
+                    elif away["score"] > home["score"]:
+                        winner = away["team"]
+
+                    best = {
+                        "home_team": home["team"],
+                        "away_team": away["team"],
+                        "home_score": home["score"],
+                        "away_score": away["score"],
+                        "winner_team": winner,
+                        "source": "ESPN matchup fallback",
+                    }
+                    best_delta = delta
+
+        except Exception:
+            log.exception(
+                "ESPN result matchup lookup failed | %s | %s vs %s | date=%s",
+                league_name, away_team, home_team, date_key
+            )
+
+    if best:
+        log.info(
+            "RESULT FOUND via ESPN matchup | %s | %s %s : %s %s",
+            league_name,
+            best["away_team"], best["away_score"],
+            best["home_score"], best["home_team"],
+        )
+
+    return best
+
+
 def fetch_event_result(event_id, league_name):
     pair = LEAGUE_ENDPOINTS.get(league_name)
     if not pair:
@@ -3710,31 +3839,64 @@ def settle_finished_picks(conn):
         return
 
     rows = conn.execute(
-        """SELECT event_id,league,home_team,away_team,pick_team,probability
+        """SELECT event_id,league,home_team,away_team,pick_team,probability,start_utc
            FROM prematch_picks
            WHERE result_status='pending'
              AND start_utc <= ?
            ORDER BY start_utc ASC
-           LIMIT 20""",
+           LIMIT 100""",
         (utcnow_iso(),),
     ).fetchall()
 
-    for row in rows:
-        event_id, league, home_team, away_team, pick_team, probability = row
+    if rows:
+        log.info("RESULT CHECK | pending_started=%d", len(rows))
 
+    for row in rows:
+        (
+            event_id, league, home_team, away_team,
+            pick_team, probability, start_utc
+        ) = row
+
+        result = None
+
+        # Baseball: Sportradar cache first.
         if league in ("KBO", "NPB", "MLB"):
             result = fetch_cached_baseball_result(conn, event_id)
-        elif league in ("K League 1", "KBL"):
-            continue
-        else:
+
+            # MLB has a reliable ESPN fallback. This also handles picks whose
+            # event_id is sr:sport_event:* and cannot be sent to ESPN summary.
+            if not result and league == "MLB":
+                result = fetch_espn_result_by_matchup(
+                    league, home_team, away_team, start_utc
+                )
+
+        # ESPN-supported non-baseball leagues: direct event id, then matchup fallback.
+        elif league in LEAGUE_ENDPOINTS:
             result = fetch_event_result(event_id, league)
+            if not result:
+                result = fetch_espn_result_by_matchup(
+                    league, home_team, away_team, start_utc
+                )
+
+        # K League/KBL currently have no reliable final-score connector in this build.
+        else:
+            log.info(
+                "RESULT SOURCE UNAVAILABLE | event=%s | league=%s | %s vs %s",
+                event_id, league, away_team, home_team
+            )
+
         if not result:
+            log.info(
+                "RESULT PENDING | event=%s | league=%s | %s vs %s | start=%s",
+                event_id, league, away_team, home_team, start_utc
+            )
             continue
 
-        # 팀 승리 픽이므로 무승부도 미적중 처리
+        # Team-win picks: draw/tie is a miss.
         final_status = (
             "hit"
-            if result["winner_team"] and same_team(pick_team, result["winner_team"])
+            if result.get("winner_team")
+            and same_team(pick_team, result.get("winner_team"))
             else "miss"
         )
 
@@ -3749,7 +3911,7 @@ def settle_finished_picks(conn):
                 final_status,
                 result["home_score"],
                 result["away_score"],
-                result["winner_team"],
+                result.get("winner_team", ""),
                 settled,
                 event_id,
             ),
@@ -3757,7 +3919,64 @@ def settle_finished_picks(conn):
         conn.commit()
 
         stats = result_stats(conn)
-        text = format_result_post(row, result, final_status, stats)
+        # format_result_post expects the original six result fields.
+        display_row = (
+            event_id, league, home_team, away_team, pick_team, probability
+        )
+        text = format_result_post(display_row, result, final_status, stats)
+
+        try:
+            # send_telegram already uses the global 120-second channel queue.
+            send_telegram(text)
+            conn.execute(
+                "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
+                (event_id,),
+            )
+            conn.commit()
+
+            log.info(
+                "RESULT POSTED | event=%s | league=%s | status=%s | pick=%s | winner=%s | score=%s-%s",
+                event_id, league, final_status, pick_team,
+                result.get("winner_team", ""),
+                result.get("away_score"), result.get("home_score"),
+            )
+
+        except Exception:
+            # Keep result_posted=0 so a later recovery pass can post it.
+            log.exception("Result Telegram post failed | event=%s", event_id)
+
+
+def repost_unposted_results(conn):
+    """Recover settled rows whose Telegram result post previously failed."""
+    rows = conn.execute(
+        """SELECT event_id,league,home_team,away_team,pick_team,probability,
+                  result_status,home_score,away_score,winner_team
+           FROM prematch_picks
+           WHERE result_status IN ('hit','miss')
+             AND result_posted=0
+           ORDER BY settled_at ASC
+           LIMIT 50"""
+    ).fetchall()
+
+    for row in rows:
+        (
+            event_id, league, home_team, away_team, pick_team, probability,
+            final_status, home_score, away_score, winner_team
+        ) = row
+
+        result = {
+            "home_team": home_team,
+            "away_team": away_team,
+            "home_score": int(home_score or 0),
+            "away_score": int(away_score or 0),
+            "winner_team": winner_team or "",
+        }
+
+        stats = result_stats(conn)
+        display_row = (
+            event_id, league, home_team, away_team, pick_team, probability
+        )
+        text = format_result_post(display_row, result, final_status, stats)
 
         try:
             send_telegram(text)
@@ -3766,10 +3985,10 @@ def settle_finished_picks(conn):
                 (event_id,),
             )
             conn.commit()
-            log.info("RESULT POSTED | event=%s | %s", event_id, final_status)
-            time.sleep(2)
+            log.info("RESULT REPOSTED | event=%s | status=%s", event_id, final_status)
         except Exception:
-            log.exception("Result Telegram post failed | event=%s", event_id)
+            log.exception("Result repost failed | event=%s", event_id)
+            break
 
 
 # =========================
@@ -3786,7 +4005,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v14.8 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.9 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
@@ -3804,6 +4023,7 @@ def main():
             log.exception("Prematch cycle error")
 
         try:
+            repost_unposted_results(conn)
             settle_finished_picks(conn)
         except Exception:
             log.exception("Result cycle error")
