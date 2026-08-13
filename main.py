@@ -57,6 +57,7 @@ SR_REQUEST_SPACING_SECONDS = float(os.getenv("SR_REQUEST_SPACING_SECONDS", "1.5"
 SR_429_BACKOFF_SECONDS = int(os.getenv("SR_429_BACKOFF_SECONDS", "900"))
 SR_429_MAX_BACKOFF_SECONDS = int(os.getenv("SR_429_MAX_BACKOFF_SECONDS", "3600"))
 TELEGRAM_POST_INTERVAL_SECONDS = int(os.getenv("TELEGRAM_POST_INTERVAL_SECONDS", "120"))
+RESULT_POST_MAX_AGE_HOURS = int(os.getenv("RESULT_POST_MAX_AGE_HOURS", "8"))
 
 NPB_YAHOO_BASE = os.getenv("NPB_YAHOO_BASE", "https://baseball.yahoo.co.jp")
 
@@ -248,6 +249,16 @@ def db():
             state_key TEXT PRIMARY KEY,
             state_value TEXT,
             updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS result_delivery_log (
+            result_key TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            delivery_status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            sent_at TEXT
         )
     """)
 
@@ -3655,6 +3666,15 @@ def fetch_espn_result_by_matchup(league_name, home_team, away_team, start_utc):
                     except Exception:
                         delta = 999999
 
+                # Never settle using yesterday's or another same-team game.
+                # Team names alone are insufficient (doubleheaders, consecutive series).
+                if delta > 3 * 3600:
+                    log.debug(
+                        "RESULT MATCH REJECTED | %s | %s vs %s | start_delta=%.1fmin",
+                        league_name, away_team, home_team, delta / 60
+                    )
+                    continue
+
                 if delta < best_delta:
                     winner = ""
                     if home["score"] > away["score"]:
@@ -3680,10 +3700,11 @@ def fetch_espn_result_by_matchup(league_name, home_team, away_team, start_utc):
 
     if best:
         log.info(
-            "RESULT FOUND via ESPN matchup | %s | %s %s : %s %s",
+            "RESULT FOUND via ESPN matchup | %s | %s %s : %s %s | start_delta=%.1fmin",
             league_name,
             best["away_team"], best["away_score"],
             best["home_score"], best["home_team"],
+            best_delta / 60,
         )
 
     return best
@@ -3765,6 +3786,96 @@ def same_team(a, b):
     return bool(aa and bb and (aa == bb or aa in bb or bb in aa))
 
 
+
+def _result_delivery_key(league, home_team, away_team, start_utc):
+    """Stable per-game result key independent of ESPN/Sportradar event_id.
+
+    Round scheduled time to 15 minutes so the same game coming from two
+    providers with a small timestamp difference still deduplicates.
+    """
+    try:
+        dt = datetime.fromisoformat(str(start_utc).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+
+        # nearest 15-minute bucket
+        total_min = dt.hour * 60 + dt.minute
+        bucket = int(round(total_min / 15.0) * 15)
+        day_shift, bucket = divmod(bucket, 24 * 60)
+        base_day = (dt + timedelta(days=day_shift)).date().isoformat()
+        hh, mm = divmod(bucket, 60)
+        time_key = f"{base_day}T{hh:02d}:{mm:02d}Z"
+    except Exception:
+        time_key = str(start_utc or "")[:16]
+
+    return "|".join([
+        str(league or "").strip().lower(),
+        norm_team(home_team),
+        norm_team(away_team),
+        time_key,
+    ])
+
+
+def _result_delivery_status(conn, result_key):
+    row = conn.execute(
+        "SELECT delivery_status FROM result_delivery_log WHERE result_key=?",
+        (result_key,),
+    ).fetchone()
+    return row[0] if row else ""
+
+
+def _reserve_result_delivery(conn, result_key, event_id):
+    """Reserve before Telegram send so a restart cannot double-send."""
+    now = utcnow_iso()
+
+    if conn.pg:
+        conn.execute(
+            """INSERT INTO result_delivery_log
+               (result_key,event_id,delivery_status,created_at,sent_at)
+               VALUES (?,?,'sending',?,NULL)
+               ON CONFLICT (result_key) DO NOTHING""",
+            (result_key, event_id, now),
+        )
+    else:
+        conn.execute(
+            """INSERT OR IGNORE INTO result_delivery_log
+               (result_key,event_id,delivery_status,created_at,sent_at)
+               VALUES (?,?,'sending',?,NULL)""",
+            (result_key, event_id, now),
+        )
+
+    conn.commit()
+
+    # We own the reservation only if status is sending and event_id matches.
+    row = conn.execute(
+        "SELECT event_id,delivery_status FROM result_delivery_log WHERE result_key=?",
+        (result_key,),
+    ).fetchone()
+
+    return bool(row and row[0] == event_id and row[1] == "sending")
+
+
+def _mark_result_delivery_sent(conn, result_key):
+    conn.execute(
+        """UPDATE result_delivery_log
+           SET delivery_status='sent',sent_at=?
+           WHERE result_key=?""",
+        (utcnow_iso(), result_key),
+    )
+    conn.commit()
+
+
+def _release_result_delivery(conn, result_key, event_id):
+    """Allow retry only when Telegram send itself raised an exception."""
+    conn.execute(
+        """DELETE FROM result_delivery_log
+           WHERE result_key=? AND event_id=? AND delivery_status='sending'""",
+        (result_key, event_id),
+    )
+    conn.commit()
+
+
 def result_stats(conn):
     rows = conn.execute(
         """SELECT result_status,settled_at
@@ -3843,9 +3954,13 @@ def settle_finished_picks(conn):
            FROM prematch_picks
            WHERE result_status='pending'
              AND start_utc <= ?
+             AND start_utc >= ?
            ORDER BY start_utc ASC
            LIMIT 100""",
-        (utcnow_iso(),),
+        (
+            utcnow_iso(),
+            (datetime.now(timezone.utc) - timedelta(hours=RESULT_POST_MAX_AGE_HOURS)).isoformat(),
+        ),
     ).fetchall()
 
     if rows:
@@ -3919,15 +4034,47 @@ def settle_finished_picks(conn):
         conn.commit()
 
         stats = result_stats(conn)
-        # format_result_post expects the original six result fields.
         display_row = (
             event_id, league, home_team, away_team, pick_team, probability
         )
         text = format_result_post(display_row, result, final_status, stats)
 
+        result_key = _result_delivery_key(
+            league, home_team, away_team, start_utc
+        )
+        existing_delivery = _result_delivery_status(conn, result_key)
+
+        if existing_delivery in ("sending", "sent"):
+            # Same game may exist under both ESPN and Sportradar event IDs.
+            conn.execute(
+                "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
+                (event_id,),
+            )
+            conn.commit()
+            log.warning(
+                "RESULT DUPLICATE SUPPRESSED | event=%s | key=%s | existing=%s",
+                event_id, result_key, existing_delivery
+            )
+            continue
+
+        if not _reserve_result_delivery(conn, result_key, event_id):
+            conn.execute(
+                "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
+                (event_id,),
+            )
+            conn.commit()
+            log.warning(
+                "RESULT DUPLICATE SUPPRESSED after reservation race | event=%s | key=%s",
+                event_id, result_key
+            )
+            continue
+
         try:
-            # send_telegram already uses the global 120-second channel queue.
+            # Reservation is committed BEFORE Telegram send.
             send_telegram(text)
+
+            _mark_result_delivery_sent(conn, result_key)
+
             conn.execute(
                 "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
                 (event_id,),
@@ -3935,33 +4082,72 @@ def settle_finished_picks(conn):
             conn.commit()
 
             log.info(
-                "RESULT POSTED | event=%s | league=%s | status=%s | pick=%s | winner=%s | score=%s-%s",
-                event_id, league, final_status, pick_team,
+                "RESULT POSTED | event=%s | league=%s | status=%s | key=%s | pick=%s | winner=%s | score=%s-%s",
+                event_id, league, final_status, result_key, pick_team,
                 result.get("winner_team", ""),
                 result.get("away_score"), result.get("home_score"),
             )
 
         except Exception:
-            # Keep result_posted=0 so a later recovery pass can post it.
+            # If Telegram itself failed, release reservation for a later retry.
+            _release_result_delivery(conn, result_key, event_id)
             log.exception("Result Telegram post failed | event=%s", event_id)
 
 
-def repost_unposted_results(conn):
-    """Recover settled rows whose Telegram result post previously failed."""
+
+def suppress_stale_result_posts(conn):
+    """Do not dump old hit/miss posts after a restart or redeploy."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=RESULT_POST_MAX_AGE_HOURS)
+    ).isoformat()
+
     rows = conn.execute(
-        """SELECT event_id,league,home_team,away_team,pick_team,probability,
-                  result_status,home_score,away_score,winner_team
+        """SELECT event_id,league,settled_at
            FROM prematch_picks
            WHERE result_status IN ('hit','miss')
              AND result_posted=0
+             AND (settled_at IS NULL OR settled_at < ?)""",
+        (cutoff,),
+    ).fetchall()
+
+    if not rows:
+        return
+
+    for event_id, league, settled_at in rows:
+        conn.execute(
+            "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
+            (event_id,),
+        )
+
+    conn.commit()
+    log.warning(
+        "STALE RESULT POSTS SUPPRESSED | count=%d | older_than=%dh",
+        len(rows), RESULT_POST_MAX_AGE_HOURS
+    )
+
+
+def repost_unposted_results(conn):
+    """Retry only fresh result posts; never dump yesterday's backlog."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=RESULT_POST_MAX_AGE_HOURS)
+    ).isoformat()
+
+    rows = conn.execute(
+        """SELECT event_id,league,home_team,away_team,pick_team,probability,
+                  result_status,home_score,away_score,winner_team,settled_at,start_utc
+           FROM prematch_picks
+           WHERE result_status IN ('hit','miss')
+             AND result_posted=0
+             AND settled_at >= ?
            ORDER BY settled_at ASC
-           LIMIT 50"""
+           LIMIT 50""",
+        (cutoff,),
     ).fetchall()
 
     for row in rows:
         (
             event_id, league, home_team, away_team, pick_team, probability,
-            final_status, home_score, away_score, winner_team
+            final_status, home_score, away_score, winner_team, settled_at, start_utc
         ) = row
 
         result = {
@@ -3978,15 +4164,45 @@ def repost_unposted_results(conn):
         )
         text = format_result_post(display_row, result, final_status, stats)
 
-        try:
-            send_telegram(text)
+        result_key = _result_delivery_key(
+            league, home_team, away_team, start_utc
+        )
+        existing_delivery = _result_delivery_status(conn, result_key)
+
+        if existing_delivery in ("sending", "sent"):
             conn.execute(
                 "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
                 (event_id,),
             )
             conn.commit()
-            log.info("RESULT REPOSTED | event=%s | status=%s", event_id, final_status)
+            log.warning(
+                "RESULT REPOST DUPLICATE SUPPRESSED | event=%s | key=%s | existing=%s",
+                event_id, result_key, existing_delivery
+            )
+            continue
+
+        if not _reserve_result_delivery(conn, result_key, event_id):
+            conn.execute(
+                "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
+                (event_id,),
+            )
+            conn.commit()
+            continue
+
+        try:
+            send_telegram(text)
+            _mark_result_delivery_sent(conn, result_key)
+            conn.execute(
+                "UPDATE prematch_picks SET result_posted=1 WHERE event_id=?",
+                (event_id,),
+            )
+            conn.commit()
+            log.info(
+                "RESULT REPOSTED | event=%s | status=%s | key=%s | settled_at=%s",
+                event_id, final_status, result_key, settled_at
+            )
         except Exception:
+            _release_result_delivery(conn, result_key, event_id)
             log.exception("Result repost failed | event=%s", event_id)
             break
 
@@ -3994,8 +4210,50 @@ def repost_unposted_results(conn):
 # =========================
 # MAIN
 # =========================
+def backfill_result_delivery_log(conn):
+    """Seed dedupe keys from historical rows already known as posted."""
+    rows = conn.execute(
+        """SELECT event_id,league,home_team,away_team,start_utc,settled_at
+           FROM prematch_picks
+           WHERE result_status IN ('hit','miss')
+             AND result_posted=1"""
+    ).fetchall()
+
+    inserted = 0
+    for event_id, league, home_team, away_team, start_utc, settled_at in rows:
+        key = _result_delivery_key(
+            league, home_team, away_team, start_utc
+        )
+        if _result_delivery_status(conn, key):
+            continue
+
+        now = settled_at or utcnow_iso()
+
+        if conn.pg:
+            conn.execute(
+                """INSERT INTO result_delivery_log
+                   (result_key,event_id,delivery_status,created_at,sent_at)
+                   VALUES (?,?,'sent',?,?)
+                   ON CONFLICT (result_key) DO NOTHING""",
+                (key, event_id, now, now),
+            )
+        else:
+            conn.execute(
+                """INSERT OR IGNORE INTO result_delivery_log
+                   (result_key,event_id,delivery_status,created_at,sent_at)
+                   VALUES (?,?,'sent',?,?)""",
+                (key, event_id, now, now),
+            )
+        inserted += 1
+
+    conn.commit()
+    if inserted:
+        log.info("RESULT DELIVERY DEDUPE BACKFILLED | count=%d", inserted)
+
+
 def main():
     conn = db()
+    backfill_result_delivery_log(conn)
 
     article_count = conn.execute(
         "SELECT COUNT(*) FROM sent_articles"
@@ -4005,7 +4263,7 @@ def main():
         seed_existing(conn)
 
     log.info(
-        "SportNow v14.9 started | channel=%s | interval=%ss | postgres=%s",
+        "SportNow v14.11 started | channel=%s | interval=%ss | postgres=%s",
         CHANNEL_ID,
         CHECK_INTERVAL,
         bool(DATABASE_URL),
@@ -4023,6 +4281,7 @@ def main():
             log.exception("Prematch cycle error")
 
         try:
+            suppress_stale_result_posts(conn)
             repost_unposted_results(conn)
             settle_finished_picks(conn)
         except Exception:
