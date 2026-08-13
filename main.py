@@ -15,7 +15,7 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))
 POST_INTERVAL = int(os.getenv("TELEGRAM_POST_INTERVAL_SECONDS", "120"))
 LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "24"))
 LINEUP_RECHECK_SECONDS = int(os.getenv("LINEUP_RECHECK_SECONDS", "180"))
-LINEUP_DEADLINE_MINUTES = int(os.getenv("LINEUP_DEADLINE_MINUTES", "30"))
+NEW_PICK_CUTOFF_MINUTES = int(os.getenv("NEW_PICK_CUTOFF_MINUTES", "30"))
 NEWS_LOOKBACK_HOURS = int(os.getenv("NEWS_LOOKBACK_HOURS", "72"))
 PROMO_URL = os.getenv("PROMO_URL", "")
 PROMO_BUTTON_TEXT = os.getenv("PROMO_BUTTON_TEXT", "바로가기")
@@ -281,8 +281,9 @@ def news_for_game(g):
     except Exception:return []
 
 # ---------- analysis ----------
-def analyze(g):
-    g=enrich(g)
+def analyze(g, already_enriched=False):
+    if not already_enriched:
+        g=enrich(g)
     news=news_for_game(g)
     context={"game":g,"news":news}
     prompt=f"""
@@ -398,13 +399,31 @@ def cycle():
         key=game_key(g)
         if key in st["posted"]: continue
         mins=(parse_dt(g["start_utc"])-now_utc()).total_seconds()/60
-        # Analyze in the final 6h. Baseball waits for lineup until T-30.
-        if mins>360:continue
+        # Analyze only from T-120 to T-30.
+        # T-30 or closer: never create a new pick, even if lineup appears late.
+        if mins > 120:
+            continue
+        if mins <= NEW_PICK_CUTOFF_MINUTES:
+            log.info("SKIP LATE GAME | %s | %.1fmin | cutoff=T-%d",
+                     key, mins, NEW_PICK_CUTOFF_MINUTES)
+            continue
+
         eg=enrich(dict(g))
-        has_lineup=bool(eg.get("home_lineup") or eg.get("away_lineup") or eg.get("official_lineup_text") or eg.get("starters"))
-        if g["sport"]=="baseball" and not has_lineup and mins>LINEUP_DEADLINE_MINUTES:
-            log.info("WAIT LINEUP | %s | %.1fmin",key,mins); continue
-        x=analyze(g)
+        has_lineup=bool(
+            eg.get("home_lineup")
+            or eg.get("away_lineup")
+            or eg.get("official_lineup_text")
+            or eg.get("starters")
+        )
+
+        # Baseball requires lineup before publishing.
+        # Keep polling between T-120 and T-30; if it never arrives, game expires.
+        if g["sport"]=="baseball" and not has_lineup:
+            log.info("WAIT LINEUP | %s | %.1fmin | expires=T-%d",
+                     key, mins, NEW_PICK_CUTOFF_MINUTES)
+            continue
+
+        x=analyze(eg, already_enriched=True)
         if not x:continue
         send(format_pick(x))
         st["posted"][key]={"game":g,"pick_side":x["pick_side"],"posted_at":now_utc().isoformat()}
@@ -412,7 +431,7 @@ def cycle():
         log.info("PICK POSTED | %s",key)
 
 def main():
-    log.info("SPORT NOW v15 CLEAN started | odds=OFF | sportradar=REMOVED")
+    log.info("SPORT NOW v15.1 started | odds=OFF | sportradar=REMOVED")
     while True:
         try:cycle()
         except Exception:log.exception("cycle failed")
