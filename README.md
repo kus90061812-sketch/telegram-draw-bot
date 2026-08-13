@@ -1,13 +1,27 @@
-# SPORT NOW v14.11 — Result Idempotency
+# SPORT NOW v15 CLEAN
 
-이미 올린 적중/미적중 결과가 다시 올라오는 문제를 추가로 차단합니다.
+기존 v14 패치 누적판을 이어붙이지 않고 새로 만든 최소 구조입니다.
 
-중복 방지:
-- event_id가 달라도 같은 리그 + 같은 홈/원정 + 같은 경기시간이면 같은 결과로 취급
-- 경기시간은 15분 단위 semantic key로 정규화
-- Telegram 전송 전에 result_delivery_log에 `sending` 예약을 DB commit
-- Railway 재시작/재배포가 전송 직후 발생해도 동일 결과 재전송 방지
-- 성공 시 `sent`로 변경
-- 실제 Telegram send가 예외를 낸 경우에만 예약을 풀어 재시도 허용
-- 과거 result_posted=1 데이터도 시작 시 dedupe table로 backfill
-- 오래된 결과 8시간 제한과 ESPN 결과 ±3시간 매칭은 그대로 유지
+## 원칙
+- Sportradar 완전 제거
+- 배당 분석 완전 제거
+- 뉴스 + 라인업 + 선발 + 부상/결장 + 일정/최근 흐름만 AI에 전달
+- AI는 제공된 데이터 밖의 사실을 만들지 않도록 제한
+- 코멘트 1문장, 핵심 근거 2~3개
+- 야구는 라인업이 없으면 T-30분까지 대기, 이후 '라인업 미확인' 상태로만 분석 가능
+- MLB: MLB Stats API
+- KBO: Naver Sports 일정/라인업 + KBO 공식 사이트를 뉴스/검증 소스로 확장 가능
+- NPB: NPB.jp 일정/오더
+- 축구/농구: ESPN 일정/summary
+- 결과는 provider event ID로만 조회하도록 설계. 팀명만으로 전날 경기 결과를 매칭하지 않음.
+
+## 주의
+KBO/NPB/축구 사이트/API 응답 구조는 외부에서 변경될 수 있습니다.
+그래서 소스별 adapter 함수를 분리했고, 한 소스 실패가 전체 cycle을 죽이지 않도록 구성했습니다.
+
+## Railway
+Start Command:
+python main.py
+
+Variables:
+.env.example 참고
