@@ -123,7 +123,7 @@ def kbo_games():
     out=[]; now=now_utc(); kst=timezone(timedelta(hours=9))
     for d in (0,1):
         ds=(now.astimezone(kst)+timedelta(days=d)).strftime("%Y-%m-%d")
-        data=get_json("https://api-gw.sports.naver.com/schedule/games",
+        data=get_json("https://disabled.invalid/schedule/games",
             {"upperCategoryId":"kbaseball","fromDate":ds,"toDate":ds})
         if not data: continue
         def walk(o):
@@ -221,8 +221,8 @@ def kbo_lineup(g):
     # Naver game detail is primary fast lineup source.
     gid=g["provider_id"]
     candidates=[
-        f"https://api-gw.sports.naver.com/game/lineup?gameId={gid}",
-        f"https://api-gw.sports.naver.com/game/{gid}/lineup",
+        f"https://disabled.invalid/game/lineup?gameId={gid}",
+        f"https://disabled.invalid/game/{gid}/lineup",
     ]
     for url in candidates:
         data=get_json(url)
@@ -431,7 +431,7 @@ def cycle():
         log.info("PICK POSTED | %s",key)
 
 def main():
-    log.info("SPORT NOW v15.1 started | odds=OFF | sportradar=REMOVED")
+    log.info("SPORT NOW v15.3 started | odds=OFF | sportradar=REMOVED")
     while True:
         try:cycle()
         except Exception:log.exception("cycle failed")
