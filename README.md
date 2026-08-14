@@ -33,3 +33,19 @@ Variables:
 - 야구 라인업이 T-30까지 확인되지 않으면 해당 경기는 자동 스킵
 - 라인업 대기 마감과 게시 마감을 별도 조건으로 두지 않아 경계 충돌 방지
 - `NEW_PICK_CUTOFF_MINUTES=30`
+
+## v15.4 KBO official schedule hotfix
+- Removed every `api-gw.sports.naver.com` / `disabled.invalid` request.
+- KBO schedule discovery now uses the official KBO Daily Schedule page.
+- No fake replacement hostname.
+- KBO lineup remains fail-closed: without a verified lineup source, no KBO pick is published.
+- T-30 cutoff remains.
+
+## v15.5 ESPN fallback
+ESPN schedule requests now try:
+1. site.api.espn.com
+2. site.web.api.espn.com
+3. cdn.espn.com scoreboard fallback
+
+403/404/429/5xx from one ESPN host no longer stops that league immediately.
+Applies to all ESPN-backed soccer leagues and NBA. T-30 cutoff is unchanged.

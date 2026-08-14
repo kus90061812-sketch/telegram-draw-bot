@@ -60,11 +60,32 @@ def game_key(g):
     return "|".join([g["league"], norm(g["home"]), norm(g["away"]), g["start_utc"][:16]])
 
 def get_json(url, params=None, timeout=15):
-    try:
-        r=S.get(url,params=params,timeout=timeout)
-        if r.status_code==200: return r.json()
-        log.warning("HTTP %s | %s",r.status_code,url)
-    except Exception: log.exception("GET failed | %s",url)
+    """GET JSON with ESPN domain fallback.
+
+    ESPN's public-facing endpoints can return 403 selectively from hosted
+    environments. For ESPN Site API requests, retry the equivalent
+    site.web.api.espn.com host before giving up.
+    """
+    urls=[url]
+    if "://site.api.espn.com/" in url:
+        urls.append(url.replace("://site.api.espn.com/", "://site.web.api.espn.com/", 1))
+
+    last_status=None
+    for i,u in enumerate(urls):
+        try:
+            r=S.get(u,params=params,timeout=timeout)
+            last_status=r.status_code
+            if r.status_code==200:
+                if i:
+                    log.info("ESPN FALLBACK OK | %s",u)
+                return r.json()
+            if r.status_code in (403,404,429,500,502,503,504):
+                log.warning("HTTP %s | %s%s",r.status_code,u,
+                            " | trying fallback" if i+1<len(urls) else "")
+                continue
+            log.warning("HTTP %s | %s",r.status_code,u)
+        except Exception:
+            log.exception("GET failed | %s",u)
     return None
 
 # ---------- schedules ----------
@@ -74,8 +95,21 @@ def espn_games():
     dates={(now+timedelta(days=d)).strftime("%Y%m%d") for d in (0,1)}
     for sport,slug,label,kind in ESPN_LEAGUES:
         for ds in dates:
-            data=get_json(f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{slug}/scoreboard",{"dates":ds})
-            if not data: continue
+            data=get_json(
+                f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{slug}/scoreboard",
+                {"dates":ds}
+            )
+            if not data:
+                # ESPN CDN is a separate fallback path for scoreboard data.
+                cdn=get_json(
+                    f"https://cdn.espn.com/core/{sport}/scoreboard",
+                    {"xhr":"1","league":slug,"dates":ds}
+                )
+                if cdn:
+                    data=(cdn.get("content") or {}).get("sbData") or cdn.get("scoreboard") or cdn
+            if not data:
+                log.warning("ESPN SCOREBOARD UNAVAILABLE | %s | %s",slug,ds)
+                continue
             for ev in data.get("events",[]):
                 comp=(ev.get("competitions") or [{}])[0]
                 status=((comp.get("status") or {}).get("type") or {})
@@ -425,7 +459,7 @@ def cycle():
         log.info("PICK POSTED | %s",key)
 
 def main():
-    log.info("SPORT NOW v15.4 started | odds=OFF | sportradar=REMOVED")
+    log.info("SPORT NOW v15.5 started | odds=OFF | sportradar=REMOVED")
     while True:
         try:cycle()
         except Exception:log.exception("cycle failed")
