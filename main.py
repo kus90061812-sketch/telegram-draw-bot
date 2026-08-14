@@ -119,33 +119,47 @@ def mlb_games():
     return out
 
 def kbo_games():
-    """Naver Sports schedule gateway. KBO official pages are used later for context/news."""
+    """KBO official Daily Schedule parser. No Naver private/undocumented gateway."""
     out=[]; now=now_utc(); kst=timezone(timedelta(hours=9))
+    team_codes={"LG","HANWHA","SSG","SAMSUNG","NC","KT","LOTTE","KIA","DOOSAN","KIWOOM"}
     for d in (0,1):
-        ds=(now.astimezone(kst)+timedelta(days=d)).strftime("%Y-%m-%d")
-        data=get_json("https://disabled.invalid/schedule/games",
-            {"upperCategoryId":"kbaseball","fromDate":ds,"toDate":ds})
-        if not data: continue
-        def walk(o):
-            if isinstance(o,dict):
-                if (o.get("gameId") or o.get("id")) and any(k in o for k in ("homeTeamName","homeTeam","home")):
-                    yield o
-                for v in o.values(): yield from walk(v)
-            elif isinstance(o,list):
-                for v in o: yield from walk(v)
-        for x in walk(data):
-            blob=json.dumps(x,ensure_ascii=False)
-            home=x.get("homeTeamName") or ((x.get("homeTeam") or {}).get("name") if isinstance(x.get("homeTeam"),dict) else "")
-            away=x.get("awayTeamName") or ((x.get("awayTeam") or {}).get("name") if isinstance(x.get("awayTeam"),dict) else "")
-            raw=x.get("gameDateTime") or x.get("startDateTime") or x.get("gameDate")
-            gid=str(x.get("gameId") or x.get("id") or "")
-            if not(home and away and raw and gid): continue
-            try:
-                start=parse_dt(raw) if ("T" in str(raw) and ("Z" in str(raw) or "+" in str(raw))) else datetime.fromisoformat(str(raw)).replace(tzinfo=kst).astimezone(timezone.utc)
-            except: continue
-            if now < start <= now+timedelta(hours=LOOKAHEAD_HOURS):
-                out.append({"event_id":f"kbo:{gid}","provider_id":gid,"provider":"naver-kbo",
-                    "sport":"baseball","league":"KBO","home":home,"away":away,"start_utc":start.isoformat()})
+        day=(now.astimezone(kst)+timedelta(days=d))
+        # Official English KBO schedule supports year/month and exposes date/time/game table.
+        url=f"https://eng.koreabaseball.com/Schedule/DailySchedule.aspx?gameDate={day.strftime('%Y%m%d')}"
+        try:
+            r=S.get(url,timeout=15)
+            if r.status_code!=200:
+                log.warning("KBO official schedule HTTP %s",r.status_code); continue
+            soup=BeautifulSoup(r.text,"html.parser")
+            rows=soup.find_all("tr")
+            current_date=None
+            for tr in rows:
+                cells=[" ".join(td.stripped_strings) for td in tr.find_all(["th","td"])]
+                if not cells: continue
+                joined=" | ".join(cells)
+                dm=re.search(r"(\d{2})\.(\d{2})",joined)
+                if dm: current_date=(int(dm.group(1)),int(dm.group(2)))
+                tm=re.search(r"\b(\d{1,2}):(\d{2})\b",joined)
+                if not tm: continue
+                tokens=[]
+                for c in cells:
+                    for t in re.findall(r"\b(?:LG|HANWHA|SSG|SAMSUNG|NC|KT|LOTTE|KIA|DOOSAN|KIWOOM)\b",c):
+                        if t in team_codes: tokens.append(t)
+                # preserve order and remove duplicates
+                teams=[]
+                for t in tokens:
+                    if t not in teams: teams.append(t)
+                if len(teams)<2: continue
+                month,daynum=current_date or (day.month,day.day)
+                start=datetime(day.year,month,daynum,int(tm.group(1)),int(tm.group(2)),tzinfo=kst).astimezone(timezone.utc)
+                if not(now < start <= now+timedelta(hours=LOOKAHEAD_HOURS)): continue
+                away,home=teams[0],teams[1]
+                gid=hashlib.sha1(f"KBO|{start.isoformat()}|{away}|{home}".encode()).hexdigest()[:18]
+                out.append({"event_id":f"kbo:{gid}","provider_id":gid,"provider":"kbo-official",
+                    "sport":"baseball","league":"KBO","home":home,"away":away,"start_utc":start.isoformat(),
+                    "schedule_source":"KBO official"})
+        except Exception:
+            log.exception("KBO official schedule failed")
     return out
 
 def npb_games():
@@ -218,29 +232,9 @@ def espn_summary_context(g):
     return out
 
 def kbo_lineup(g):
-    # Naver game detail is primary fast lineup source.
-    gid=g["provider_id"]
-    candidates=[
-        f"https://disabled.invalid/game/lineup?gameId={gid}",
-        f"https://disabled.invalid/game/{gid}/lineup",
-    ]
-    for url in candidates:
-        data=get_json(url)
-        if not data: continue
-        found=[]
-        def walk(o):
-            if isinstance(o,dict):
-                for k,v in o.items():
-                    if k.lower() in ("playername","name") and isinstance(v,str): found.append(v)
-                    walk(v)
-            elif isinstance(o,list):
-                for v in o:walk(v)
-        walk(data)
-        names=[]
-        for x in found:
-            if x not in names:names.append(x)
-        if len(names)>=14:
-            return {"home_lineup":names[:9],"away_lineup":names[9:18],"lineup_source":"Naver Sports"}
+    """KBO lineup: do not call dead/private endpoints.
+    v15.4 fails closed until a verified public lineup source is available.
+    """
     return {}
 
 def npb_lineup(g):
@@ -431,7 +425,7 @@ def cycle():
         log.info("PICK POSTED | %s",key)
 
 def main():
-    log.info("SPORT NOW v15.3 started | odds=OFF | sportradar=REMOVED")
+    log.info("SPORT NOW v15.4 started | odds=OFF | sportradar=REMOVED")
     while True:
         try:cycle()
         except Exception:log.exception("cycle failed")
