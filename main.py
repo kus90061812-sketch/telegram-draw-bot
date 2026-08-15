@@ -81,6 +81,14 @@ def ko_team(x): return TEAM_KO.get(str(x or "").strip(), str(x or "").strip())
 def now_utc(): return datetime.now(timezone.utc)
 def parse_dt(x): return datetime.fromisoformat(str(x).replace("Z","+00:00"))
 def norm(x): return re.sub(r"[^a-z0-9가-힣ぁ-んァ-ン一-龥]","",str(x or "").lower())
+def same_team(a, b):
+    """Provider-safe MLB team comparison."""
+    na = norm(a)
+    nb = norm(b)
+    if not na or not nb:
+        return False
+    return na == nb or na in nb or nb in na
+
 def game_key(g):
     return "|".join([g["league"], norm(g["home"]), norm(g["away"]), g["start_utc"][:16]])
 
@@ -236,7 +244,7 @@ def mlb_odds(game):
                 "details":o.get("details") or "",
             }
     except Exception:
-        log.exception("MLB odds fetch failed | %s", game_key(game))
+        log.exception("MLB odds fetch failed | %s | provider_id=%s", game_key(game), game.get("provider_id"))
     return {}
 
 
@@ -736,7 +744,7 @@ def cycle():
 
 def main():
     init_review_db()
-    log.info("SPORT NOW v16.1 MLB ONLY started | odds=ON | korean-output=ON | review-learning=ON")
+    log.info("SPORT NOW v16.2 MLB ONLY started | odds=ON | korean-output=ON | review-learning=ON")
     while True:
         try:cycle()
         except Exception:log.exception("cycle failed")

@@ -16,3 +16,8 @@ Enabled:
 
 Odds are a supporting signal only. The model is instructed to prioritize actual
 lineup, starter, injury/news and team context over the market.
+
+## v16.2 hotfix
+- Fixed `NameError: same_team is not defined` in MLB odds matching.
+- Added provider-safe normalized MLB team comparison.
+- Odds failure remains isolated to the affected game; the rest of the MLB cycle continues.
