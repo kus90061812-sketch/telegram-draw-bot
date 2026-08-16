@@ -21,3 +21,9 @@ lineup, starter, injury/news and team context over the market.
 - Fixed `NameError: same_team is not defined` in MLB odds matching.
 - Added provider-safe normalized MLB team comparison.
 - Odds failure remains isolated to the affected game; the rest of the MLB cycle continues.
+
+## v16.3 fixed weighting
+MLB analysis uses a fixed 100-point weighting:
+lineup 30 / starter 30 / bullpen 15 / injuries & same-day news 10 /
+recent form 10 / market odds 5.
+Missing evidence lowers confidence instead of being invented.

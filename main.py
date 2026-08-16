@@ -24,6 +24,16 @@ PROMO_BUTTON_TEXT = os.getenv("PROMO_BUTTON_TEXT", "바로가기")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 REVIEW_LOOKBACK = int(os.getenv("REVIEW_LOOKBACK", "20"))
 
+# Fixed MLB analysis weights (total 100)
+MLB_ANALYSIS_WEIGHTS = {
+    "confirmed_lineup": 30,
+    "starting_pitcher": 30,
+    "bullpen": 15,
+    "injury_news": 10,
+    "recent_form": 10,
+    "market_odds": 5,
+}
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 log = logging.getLogger("sportnow-v15")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -568,17 +578,21 @@ def analyze(g, already_enriched=False):
         g=enrich(g)
     news=news_for_game(g)
     lessons=recent_lessons(g)
-    context={"game":g,"news":news,"recent_postgame_lessons":lessons}
+    context={"game":g,"news":news,"analysis_weights":MLB_ANALYSIS_WEIGHTS,"recent_postgame_lessons":lessons}
     prompt=f"""
 너는 SPORT NOW MLB 프리뷰 분석가다.
 아래 제공 데이터만 사용하고, 기억으로 선수 상태나 기록을 만들어내지 않는다.
 
-분석 우선순위:
-1. 확정 선발 라인업과 핵심 타자 출전 여부
-2. 선발투수 및 최근 관련 뉴스
-3. 부상·말소·복귀·휴식·불펜 소모 관련 정보
-4. 최근 팀 흐름과 홈/원정 요소
-5. 배당 시장 정보(머니라인/스프레드/기준점)는 보조 신호로 분석
+반드시 다음 고정 비율로 분석하며 경기마다 임의로 비중을 바꾸지 않는다.
+- 확정 타선 30%: 상·중·하위 타선 구성과 핵심 타자 출전 여부
+- 선발투수 30%: 선발 확정 및 제공된 시즌/최근 투구 정보
+- 불펜 15%: 최근 소모·연투·가용 핵심 불펜 정보
+- 부상·당일 뉴스 10%: 결장·복귀·말소·당일 팀 관련 정보
+- 최근 흐름 10%: 최근 타격/투구 흐름 및 홈·원정 맥락
+- 배당 5%: 머니라인·스프레드·기준점과 시장 방향
+
+정보가 없는 항목은 추측하지 말고 전체 신뢰도를 낮춘다.
+배당은 보조지표이며 라인업·투수 데이터보다 우선할 수 없다.
 
 배당은 단독 근거로 픽을 정하지 않는다.
 머니라인이 있으면 implied probability를 참고하되 북메이커 마진이 포함된 값임을 전제로 한다.
@@ -598,8 +612,11 @@ comment는 딱 한 문장, 45자 안팎. 장문 금지.
 recent_postgame_lessons가 있으면 같은 유형의 판단 실수를 반복하지 않는 참고자료로만 사용한다.
 복기 때문에 특정 팀을 자동 감점/가점하지 않는다. 현재 경기의 실제 데이터가 항상 우선이다.
 
+각 항목을 0~100으로 평가하여 weighted_components에 기록한다.
+score는 위 고정 비율을 반영한 종합 신뢰점수다.
+
 JSON만:
-{{"publish":true,"pick_side":"home","score":66,"reasons":["...","..."],"comment":"..."}}
+{{"publish":true,"pick_side":"home","score":66,"weighted_components":{{"confirmed_lineup":70,"starting_pitcher":68,"bullpen":55,"injury_news":60,"recent_form":62,"market_odds":54}},"reasons":["...","..."],"comment":"..."}}
 
 DATA:
 {json.dumps(context,ensure_ascii=False)}
@@ -744,7 +761,7 @@ def cycle():
 
 def main():
     init_review_db()
-    log.info("SPORT NOW v16.2 MLB ONLY started | odds=ON | korean-output=ON | review-learning=ON")
+    log.info("SPORT NOW v16.3 MLB ONLY started | weighted-analysis=ON | odds=ON | korean-output=ON | review-learning=ON")
     while True:
         try:cycle()
         except Exception:log.exception("cycle failed")
